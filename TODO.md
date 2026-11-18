@@ -14,14 +14,38 @@
 
 代码全绿只证明逻辑对，不证明这套东西能在真库上跑：并发、扩展、连接串、向量表都没被真验证过。
 
-- [ ] `.env` 的 `DATABASE_URL` 换成 `~/.pgpass` 里的真实密码（别用超户跑应用：建 `knowledge_base` 角色，只给它那一个库）
+- [ ] `.env` 的 `DATABASE_URL` 填本机 postgres 超户的真实密码（本地开发就这么跑，不用另建角色；密码别提交，`.env` 已 gitignore）
+      → 顺带解释为什么超户在本地反而方便：`PGVector(create_extension=True)` 首次使用要执行 `CREATE EXTENSION vector`，普通角色做不了这一步
 - [ ] `createdb -U postgres -h 127.0.0.1 knowledge_base` → `scripts/init_db.py` 建 8 张表 → `psql \dt` 核对
-- [ ] `CREATE EXTENSION vector;`（pgvector 0.8.7 已装但没执行过），然后 `MEMORY_BACKEND=pgvector` 跑一遍记忆读写
+- [ ] 扩展不用手动建：超户 + `create_extension=True` 在首次使用时会自动执行 `CREATE EXTENSION vector`。
+      但要**核对一次真装上了**：`psql` 里执行 `\dx`，能看到名为 `vector` 的扩展（版本应是 0.8.x）
 - [ ] **真 PG 冒烟**：`DATABASE_URL` 指向 PG 再跑一遍现有 321 条测试（现在 100% 走临时 SQLite）
 - [ ] 验证 `with_for_update` 并发不丢更新：两个 session 同时 `bump_kb_version`
       （SQLite 直接忽略 `FOR UPDATE`，这条路径至今没被真验证过）
 - [ ] 故意把表删掉 → `/health` 必须 503 + 缺表清单；`DB_STRICT_STARTUP=True` 必须拒绝启动
-- [ ] 文档向量化入库（**代码就绪、一次都没连库跑过**）：定 embedding 厂商/模型/维度 →
+#### 定 embedding 模型（这一步不动，向量化就只能不做）
+
+pgvector 只提供**存向量的列类型 + 距离算子 + 索引**，它自己不会把中文变成向量；
+把文字变成一串浮点数的是 **embedding 模型**，而 DeepSeek 没有 embedding 接口 —— 
+所以「用哪家」和对话模型是两件独立的事，配置里也是两组变量（`LLM_*` 与 `EMBEDDING_*`）。
+
+必须先定的原因（不是洁癖，是返工成本）：
+1. 维度写死在列类型里：`_build_vectorstore(embedding_length=EMBEDDING_DIMS)` 会建出 `vector(1536)` 这种列，
+   换一个不同维度的模型，插入直接报错，只能删 collection 重建 + 全量重算；
+2. **维度碰巧一样也不通用**：不同模型的向量空间互不兼容，新模型的 query 去比旧模型的文档向量，
+   cosine 出来是噪声 —— 不报错、只是答得差，这种坑最难发现；
+3. 提问也要 embedding：每轮问答一次调用，所以它还影响延迟、费用，以及「资料要不要出网」。
+
+候选（都走 OpenAI 兼容协议，现有代码不用改，只动 `.env`）：
+- **本地 Ollama `bge-m3`（推荐）**：1024 维、中文效果好、资料不出网、免费，`EMBEDDING_BASE_URL=http://127.0.0.1:11434/v1`。
+  代价：多一个常驻服务 + 下载模型（~1.2GB）。手机化场景里"私有资料不上传第三方"这条很可能变硬要求，所以优先它
+- 阿里云 DashScope 兼容模式的 `text-embedding-v3`：1024 维、有免费额度、零运维。代价：文档片段会出网
+- 配置默认值 `text-embedding-3-small`（1536 维）：需要 OpenAI key，本机网络大概率不稳，**不建议**，
+  但它是当前默认值 —— 定了别家记得把 `EMBEDDING_DIMS` 一起改，别留着 1536
+
+⚠️ 一旦 `scripts/index_documents.py` 真跑过一次，这个决定就固化了：换模型 = 清空 collection 重跑全库。
+
+- [ ] 文档向量化入库（**代码就绪、一次都没连库跑过**）：定完上面的 embedding 之后 →
       `scripts/index_documents.py --all` → `--query` 看召回 → `--check` 看库与 collection 状态。
       ⚠️ **维度一旦建列就不能改**，换模型要连维度带 collection 一起换，所以这一步先拍板再动手
 - [ ] `MEMORY_BACKEND=pgvector` 的**集成测试**（现在只测了不需要连接的部分：DSN 换算 / 懒构造 / 阈值折算 / 降级）
@@ -109,7 +133,7 @@
 - [ ] 登录防护：失败锁定 + 限流（`slowapi`/Redis）；注册接口仍会暴露「邮箱已被注册」
 - [ ] 软删 + 冷静期恢复（`users.deleted_at` 列已有，注销现在走硬删）
 - [ ] 审计日志：改密 / 注销 / 管理员列表 / 授权变更
-- [ ] 公网暴露前：`SECRET_KEY` 换随机、`APP_DEBUG=False`、`/docs` 关闭、上传目录权限与磁盘配额
+- [ ] 公网暴露前：`SECRET_KEY` 换随机、`APP_DEBUG=False`、`/docs` 关闭、上传目录权限与磁盘配额；**数据库账号从超户换成专用角色**（只授 `knowledge_base` 这一个库，扩展安装留给人工执行）
 - [ ] 日志结构化 + 请求 ID，错误日志不含密码/token，LLM 日志不写用户资料原文
 - [ ] Docker：`pgvector/pgvector:pg17` + api + worker + redis，数据卷持久化
 - [ ] CI：GitHub Actions 跑 `pytest` + `~/.local/bin/uvx ruff check`（venv 里没装 ruff；老代码还有基线问题，先只卡新增）
