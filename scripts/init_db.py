@@ -39,7 +39,7 @@ SNAPSHOT_HEADER = """-- ========================================================
 -- 注意 1：本脚本只 CREATE ... IF NOT EXISTS，不会给已存在的表加列/改类型。
 --         改过 models.py 后，开发库请 --drop 重建，正式环境等接 alembic（TODO.md P1）。
 -- 注意 2：向量部分还没启用（pgvector 暂不处理）：chunks 表没有 embedding 列；
---         等向量方案定了再补 CREATE EXTENSION vector / vector(N) 列 / HNSW 索引（TODO.md P0-M3）。
+--         等向量方案定了再补 CREATE EXTENSION vector / vector(N) 列 / HNSW 索引（TODO.md §1）。
 --         本机 PG 17 目前没装 pgvector 扩展，直接跑 CREATE EXTENSION 会报错，所以先注释掉。
 -- ============================================================
 

@@ -47,7 +47,7 @@ EVENT_DONE = "done"
 EVENT_ERROR = "error"
 
 # 帧序号：每帧 +1 写进 `id:`。浏览器/前端重连时会带 `Last-Event-ID` 回来，
-# 服务端据此决定"从哪条消息的哪个位置续播"——真正的续传要等 M5 会话落库后做（见 TODO.md M5）。
+# 服务端据此决定"从哪条消息的哪个位置续播"——会话已落库（M5 完成），但续传本身还没实现，待办见 TODO.md §3。
 
 
 def envelope(status: int, msg: str, data: dict[str, Any] | None = None) -> dict[str, Any]:

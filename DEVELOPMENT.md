@@ -325,3 +325,24 @@ data: {"status":200,"msg":"chunk","data":{"text":"你好"}}
 | `app/api/v1/aichatrouter.py` | 会话表没有 agent 列，`/agents` 是配置常量，前端选了也不落库 | M8 给 `chat_sessions` 加 `agent` 列并把 `build_agent()` 接进 `answer.py` |
 | `chunks.embedding` | 还没有向量列（按要求先不做 pgvector） | M3 再加列 + HNSW 索引，并回填 `knowledge_bases.embedding_model/embedding_dim` |
 | 已修复（别当坑抄） | `aichatrouter.py` 的 8 个 `pass` 占位（实测返回 `200 + null`，前端解包必炸）→ 已实现并 include；`/agents` 一开始漏了鉴权 → 已补 `CurrentUser`；`tokens` 存 JWT 原文 → 改 sha256；`get_optional_user` 漏校验吊销 token；`/user/info?user_id=` 越权面；`init_db.sql` 与 ORM 漂移 | — |
+
+## 13. 前端与移动端形态（已拍板，实施待做）
+
+结论：**Vue 3 + Vite + TypeScript，打包成手机 App 走 Capacitor 壳（WebView）**。
+2026-11-14 定的；待办清单在 `TODO.md` §4/§5，这里只留判定依据，避免以后重新论证一遍。
+
+| 做法 | 出 APK | 文件/相册选择 | 系统通知 | 返回键/生命周期 | 存储持久 | 代价 |
+| --- | :-: | :-: | :-: | :-: | :-: | --- |
+| **Capacitor 壳**（选它） | 一条命令 | 插件现成 | 现成（推送需 FCM） | 已处理 | `Preferences` | 依赖 node + Android Studio |
+| 手写最小壳（1 个 Activity + WebView） | 自己写 | 要自己实现 `onShowFileChooser` + FileProvider | 自己接 | 自己拦 `goBack()` | `localStorage` 会被清缓存带走 | 看着省 2 小时，桥要一座座补 |
+
+壳本体确实只有几十行，所以「WebView 就行」这个判断成立；要 Capacitor 恰恰是为了它那几座
+**我们必然会用到的桥**：文件选择（上传文档）、持久 token（否则莫名掉登录）、后台通知（解析/重索引）。
+Tauri v2 mobile 也走系统 WebView，但要多学一套 Rust 工具链，体积小这点收益抵不过成本，不选。
+
+状态管理用 `@tanstack/vue-query` 承担服务端状态（重试/失效/分页/乐观更新），Pinia 只管纯 UI 状态；
+Markdown 渲染必须过 `dompurify`（模型输出直接 `v-html` 等于开放 XSS）。
+
+过渡形态零成本：**手机浏览器直连** `http://<局域网IP>:8000`（后端 `--host 0.0.0.0`）先跑通全链路，
+再打 APK —— 顺序不能反，浏览器跑不通就别怪壳。Android 9+ / iOS ATS 默认拒绝明文 HTTP，
+调试期用 `usesCleartextTraffic` 放行，**正式上线必须真 HTTPS**，别把明文开关全局打开。

@@ -2,7 +2,7 @@
 
 一个 AI 本地知识库。
 
-- **[TODO.md](TODO.md)** —— 还差什么没实现（知识库主线 M1–M6、安全收尾、工程化），做功能先看这里
+- **[TODO.md](TODO.md)** —— 还差什么没实现（数据库与向量库的真验证、知识库 M0、前端、手机化、安全收尾），做功能先看这里
 - **[DEVELOPMENT.md](DEVELOPMENT.md)** —— 开发规范（分层、统一返回格式、命名、鉴权、测试、Git、依赖）
 
 ## 目录结构
@@ -267,7 +267,7 @@ event: done         {"status":200,"msg":"done","data":{"text":"全文"}}
 event: error        {"status":500,"msg":"生成中断，请重试","data":{"trace_id":"a1b2c3d4","retryable":true}}
 ```
 
-> ⚠️ `/stop` 靠进程内注册表：多 worker 部署时 stop 请求必须落到同一个进程才生效（排期见 TODO M9）。
+> ⚠️ `/stop` 靠进程内注册表：多 worker 部署时 stop 请求必须落到同一个进程才生效（待办见 `TODO.md` §3，上机相关在 §5）。
 
 ---
 
@@ -334,4 +334,4 @@ chat_messages      消息：session_id(级联删) + user_id(冗余，鉴权只�
 
 对话接口的测试**不出网**：模型只从 `answer.get_answer_model()` 取，测试把它换成假模型，于是 SSE 分帧、消息转换、检索、落库都是真链路；长期记忆换成 `NullBackend`，避免测试往 `data/memory/` 写文件。
 
-> 仍然**没有真 PG 跑通过的证据**：全部用例都是临时 SQLite，`chat_messages` 的级联删除靠 `PRAGMA foreign_keys=ON` 模拟。建库那步别省（TODO 的 M-环境）。
+> 仍然**没有真 PG 跑通过的证据**：全部用例都是临时 SQLite，`chat_messages` 的级联删除靠 `PRAGMA foreign_keys=ON` 模拟。建库那步别省（`TODO.md` §1）。

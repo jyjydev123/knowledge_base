@@ -18,7 +18,7 @@
    不再写死 `localhost:6024` 那份 docker 示例值，也不再直接读 `os.environ`。
 
 维度这件事仍然没做决定：`chunks.embedding` 列要不要加、`vector(N)` 用多少维，
-取决于 embedding 模型选型，**一旦建列就不能改**（TODO.md M3）。当前向量只存在 PGVector 自己的
+取决于 embedding 模型选型，**一旦建列就不能改**（TODO.md §1）。当前向量只存在 PGVector 自己的
 表里，靠 metadata 的 chunk_id 对应回来，所以业务表结构没被这个未定项绑死。
 """
 

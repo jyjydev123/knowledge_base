@@ -9,9 +9,9 @@
     4. 建表用 scripts/init_db.py（由本文件生成），init_db.sql 只是它的一份可读快照；
     5. 状态字段用 varchar + 本文件里的 StrEnum 常量，不建数据库枚举类型
        （PG 的 CREATE TYPE 改值很痛，varchar + CHECK/常量更灵活）；
-    6. 还没做的事：
-       - chat_history（会话/消息表）→ TODO.md P0-M5 再建
-       - chunks.embedding 向量列 + pgvector → TODO.md P0-M3，方案定了再加
+    6. 会话与消息已落库（chat_sessions / chat_messages）。还没做的：
+       - chunks.embedding 向量列 + pgvector → TODO.md §1/§7，embedding 模型与维度定了再加
+       - chat_sessions.agent（会话选哪个 agent）→ TODO.md §5，M8 一并加
 """
 
 import uuid
