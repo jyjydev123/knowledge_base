@@ -10,9 +10,10 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import ForbiddenError, NotFoundError, ParamError, UnauthorizedError
 from app.core.security import decode_access_token
-from app.db.crud import kb_crud, token_crud, user_crud
+from app.db.crud import kb_crud, token_crud
 from app.db.models import User
 from app.db.psql_config import AsyncSessionLocal, get_db
+from app.services import user_cache
 from app.services.kb_access import KbAccess, resolve
 
 # auto_error=False: 没带 Authorization 时由我们自己返回统一的 {"status":401,...}
@@ -29,6 +30,15 @@ async def get_current_user(
     """从 Authorization 头解析 JWT，取出当前登录用户
 
     校验链路: 有 token -> token 能解析 -> 用户还在 -> token 没被登出/过期
+
+    两条和缓存有关的硬规矩（改这里之前先读）：
+      1. **users 那一行走 Redis 旁路缓存**（cache-aside）。命中时返回的是脱离 Session 的
+         transient 实例 —— 只读字段安全。**要改这个用户的路由必须重新回源**
+         （`user_cache.load_for_write`：update / reset_password / delete），
+         否则会出现"属性改了、commit 什么都没写、接口还返回 200"这种最难查的 bug。
+      2. **token 是否被吊销永远查库，绝不进缓存**。
+         不然"登出/改密后旧 token 立刻失效"会被 TTL 变成"几分钟内还能用"，
+         那是拿安全属性换性能。
     """
     if credentials is None or not credentials.credentials:
         raise UnauthorizedError("未登录，请先携带 Authorization: Bearer <token>")
@@ -38,12 +48,13 @@ async def get_current_user(
     if not payload or not payload.get("sub"):
         raise UnauthorizedError("登录凭证无效或已过期，请重新登录")
 
-    user = await user_crud.get_user_by_id(payload["sub"], db)
+    user = await user_cache.get_user_cached(payload["sub"], db)
     if user is None or user.deleted_at is not None:
         raise UnauthorizedError("账号不存在或已注销，请重新登录")
     if not user.is_active:
         raise ForbiddenError("账号已被禁用，请联系管理员")
 
+    # 这一步**不能缓存**（见上面第 2 条）：登出、改密、被踢下线只体现在 tokens 表里
     if not await token_crud.is_token_active(token, db):
         raise UnauthorizedError("登录已失效（已登出或被踢下线），请重新登录")
 
@@ -81,7 +92,7 @@ async def get_optional_user(
     if not payload or not payload.get("sub"):
         raise UnauthorizedError("登录凭证无效或已过期，请重新登录")
 
-    user = await user_crud.get_user_by_id(payload["sub"], db)
+    user = await user_cache.get_user_cached(payload["sub"], db)
     if user is None or user.deleted_at is not None or not user.is_active:
         return None
     # 之前漏了这一步：已吊销的 token 不该再算登录

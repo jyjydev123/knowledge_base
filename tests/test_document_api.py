@@ -520,8 +520,10 @@ def test_status_empty_kb(client, logged_in, run, monkeypatch, tmp_path):
     data = body["data"]
     assert body["msg"] == "知识库目前没有文件"          # 空库不是异常
     assert (data["document_total"], data["disk_file_count"], data["healthy"]) == (0, 0, True)
-    # 五种状态都会补齐，前端不用猜键
-    assert set(data["status_counts"]) == {"pending", "parsing", "chunking", "indexed", "failed"}
+    # 每种状态都会补齐（含 stored：图片这类"落盘但不解析"的资源），前端不用猜键
+    assert set(data["status_counts"]) == {
+        "stored", "pending", "parsing", "chunking", "indexed", "failed"
+    }
     assert data["kb_version"] == 1
 
 

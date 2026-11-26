@@ -17,9 +17,16 @@
 3. 连接串/embedding 一律走 `settings`（`save._to_psycopg_dsn` + `save.build_embeddings`），
    不再写死 `localhost:6024` 那份 docker 示例值，也不再直接读 `os.environ`。
 
-维度这件事仍然没做决定：`chunks.embedding` 列要不要加、`vector(N)` 用多少维，
-取决于 embedding 模型选型，**一旦建列就不能改**（TODO.md §1）。当前向量只存在 PGVector 自己的
-表里，靠 metadata 的 chunk_id 对应回来，所以业务表结构没被这个未定项绑死。
+维度这件事已经拍板：**阿里云百炼 text-embedding-v3，1024 维**（config.EMBEDDING_MODEL /
+EMBEDDING_DIMS，启动时校验，非法维度直接不让进程起来）。向量仍然存在 PGVector 自己的表里，
+靠 metadata 的 chunk_id 对应回 chunks 行，**业务表里没有 vector 列** —— 好处是换模型
+只需要换 collection 重建，不用动表结构；代价是检索必须回表（见 app/rag/retrieval.py）。
+
+百炼的两个坑，代码里已经处理，改配置的人要知道：
+  1. 单请求最多 10 条文本 → OpenAIEmbeddings 的 chunk_size 必须显式设成 10
+     （EMBEDDING_BATCH_SIZE，默认值已经是 10；langchain 默认 1000，不改就每批都 400）；
+  2. 兼容模式**不支持稀疏向量**，所以混合检索只能是"稠密向量 + 关键词车道"两路合并，
+     不是 pgvector 原生的 sparse+dense。
 """
 
 from __future__ import annotations
@@ -177,12 +184,17 @@ async def remove_document_vectors(document_ids: Sequence[Any], *, vectorstore: A
 
 
 def embedding_ready() -> tuple[bool, str]:
-    """给 CLI/健康检查用：现在这条路能不能真跑"""
-    if settings.DATABASE_URL.startswith("sqlite"):
-        return False, "当前 DATABASE_URL 是 SQLite，pgvector 车道需要 PostgreSQL"
-    if not settings.embedding_ready:
-        return False, "未配置 EMBEDDING_API_KEY（DeepSeek 没有 embedding 接口，要另配一家）"
-    return True, "可以跑"
+    """给 CLI/健康检查用：现在这条路能不能真跑（口径与 retrieval.vector_lane_block_reason 一致）"""
+    from app.rag.retrieval import vector_lane_block_reason
+
+    reason = vector_lane_block_reason()
+    if reason:
+        return False, reason
+    return (
+        True,
+        f"可以跑：{settings.EMBEDDING_MODEL} / {settings.EMBEDDING_DIMS} 维 / "
+        f"单请求 {settings.EMBEDDING_BATCH_SIZE} 条 · {settings.EMBEDDING_BASE_URL}",
+    )
 
 
 __all__ = [

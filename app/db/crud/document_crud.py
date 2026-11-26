@@ -188,8 +188,24 @@ async def delete_document(document: Document, db: AsyncSession) -> bool:
     return True
 
 
+async def list_kb_document_rows(kb_id, db: AsyncSession) -> list[tuple]:
+    """删库前收磁盘用：把该库**所有**文档的 (id, owner_id, file_path) 拿回来
+
+    两个刻意的点：
+      1. **不过滤 deleted_at**：删库是硬删，级联会把软删标记的行也一起带走，
+         对应的磁盘文件也必须一起收，否则留下永远对不上账的孤儿文件；
+      2. 返回裸元组而不是 ORM 对象：路由要在删完记录之后才去删文件，
+         那时候这些对象已经从 session 里飘走了，碰属性就是 DetachedInstanceError。
+    """
+    pk = _to_uuid(kb_id)
+    if pk is None:
+        return []
+    result = await db.execute(select(Document.id, Document.owner_id, Document.file_path).where(Document.kb_id == pk))
+    return [tuple(row) for row in result.all()]
+
+
 async def count_by_status(kb_id, db: AsyncSession) -> dict[str, int]:
-    """某个知识库内各状态的文档数量（给 GET /documents/status 用）
+    """某个知识库内各状态的文档数量（给 GET /documents/status 用；stored 也在其中）
 
     这里按 kb 统计、不按上传者过滤：共享库里别人传的文档也算这个库的状态，
     调用方必须先用 kb_access 确认请求者对该库有读权限。

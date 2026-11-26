@@ -21,7 +21,9 @@ class DocumentResponse(BaseModel):
     filename: str = Field(description="上传时的原始文件名")
     file_size: int = Field(description="文件字节数")
     mime_type: str | None = Field(default=None, description="MIME 类型")
-    status: DocStatus = Field(description="入库状态: pending/parsing/chunking/indexed/failed")
+    status: DocStatus = Field(
+        description="入库状态: pending/parsing/chunking/indexed/failed；stored=已落盘不解析（图片）"
+    )
     error_msg: str | None = Field(default=None, description="失败原因，成功时为 null")
     chunk_count: int = Field(default=0, description="切出的块数量")
     token_count: int = Field(default=0, description="正文字符数（近似 token）")

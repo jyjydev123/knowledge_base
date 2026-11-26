@@ -154,6 +154,36 @@ async def ensure_schema_on_startup(engine: AsyncEngine | None = None) -> dict:
             "error": info["error"]}
 
 
+def _memory_section() -> dict:
+    """长期记忆车道的体检：配了什么、真跑不跑得动、跑不动的原因
+
+    这里只报**配置层面**能不能跑（连的是 PG、有没有 embedding key）；
+    运行时第一次读写失败仍会把进程内后端降级成"不记"（store._degrade），
+    那一步是懒的，不该为它专门连一次库拖慢 /health。
+    """
+    return {
+        "configured": settings.MEMORY_BACKEND,
+        "ok": not settings.memory_lane_block_reason,
+        "reason": settings.memory_lane_block_reason,
+    }
+
+
+async def cache_section() -> dict:
+    """`/health` 里的缓存一节：Redis 这条车道到底有没有在干活
+
+    刻意**不影响 HTTP 状态码**。Redis 只是加速器，它挂了服务照样能用（fail-open 回源数据库），
+    把 readiness 打成 503 反而会让编排系统把一台"只是没缓存"的实例摘掉 —— 放大故障。
+    但结果必须**看得到**：静默降级会让人一直以为加速在做，直到容量出问题。
+    """
+    from app.core import cache
+
+    ok, detail = await cache.ping()
+    data = cache.status()
+    data["ok"] = ok
+    data["detail"] = "" if ok else detail
+    return data
+
+
 async def health_payload(engine: AsyncEngine | None = None, timeout_seconds: float | None = None) -> tuple[int, dict]:
     """`/health` 的后端：返回 (HTTP 状态码, ApiResponse.data)
 
@@ -181,7 +211,8 @@ async def health_payload(engine: AsyncEngine | None = None, timeout_seconds: flo
                 "missing_tables": [],
                 "checked_tables": len(expected_tables()),
             },
-            "memory_backend": settings.MEMORY_BACKEND,
+            "memory_backend": _memory_section(),
+            "cache": await cache_section(),
         }
 
     try:
@@ -190,6 +221,7 @@ async def health_payload(engine: AsyncEngine | None = None, timeout_seconds: flo
         return 503, {
             "status": "degraded",
             "database": {"ok": False, "ephemeral": False, "error": ERROR_TIMEOUT},
+            "cache": await cache_section(),
         }
     status_code = 200 if info["ok"] else 503
     return status_code, {
@@ -203,5 +235,6 @@ async def health_payload(engine: AsyncEngine | None = None, timeout_seconds: flo
             "missing_tables": info["missing_tables"],
             "checked_tables": info["checked_tables"],
         },
-        "memory_backend": settings.MEMORY_BACKEND,
+        "memory_backend": _memory_section(),
+        "cache": await cache_section(),
     }

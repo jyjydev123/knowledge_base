@@ -26,10 +26,11 @@ from app.core.exceptions import (
     ParamError,
 )
 from app.db.crud import document_crud
+from app.db.models import DocStatus
 from app.schemas.common import ApiResponse, PageData, PageParams
 from app.schemas.document_schemas import DocumentDetail, DocumentResponse, DocumentStatusOut
-from app.services import kb_access
-from app.services.parsers.registry import MIME_BY_EXT
+from app.services import file_types, kb_access
+from app.services.parsers.base import UnsupportedFormatError
 from app.services.process_document import (
     SAFE_EXT,
     delete_document_file,
@@ -49,10 +50,17 @@ USER_DATA_ROOT = FsPath("data")  # 相对进程 CWD（start.sh 在项目根启�
 PREVIEW_MAX_CHARS = 2000  # 详情正文预览的截断长度
 PREVIEW_CHUNKS = 3        # 预览最多取前几块
 
-# 白名单唯一来源是解析器注册表：新增一种格式只需在 registry 里登记，
-# 否则会出现「解析器支持但上传拒收」或「上传收下但解析不了」两张皮
-ALLOWED_EXTENSIONS = MIME_BY_EXT
-MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20MB
+# 白名单唯一来源是 app/services/file_types.py（文档那侧再往上是解析器注册表）：
+# 新增一种格式只需在 registry 里登记，否则会出现「解析器支持但上传拒收」
+# 或「上传收下但解析不了」两张皮
+ALLOWED_EXTENSIONS = file_types.DOCUMENT_MIME_BY_EXT
+IMAGE_EXTENSIONS = file_types.IMAGE_MIME_BY_EXT
+
+# 体积上限从配置来（UPLOAD_MAX_SIZE_MB / IMAGE_MAX_SIZE_MB）。
+# 留在模块级是有原因的：测试靠 monkeypatch 这两个名字触发 413，
+# 改成每次调用现读 settings 反而让"测试里限制的是哪一条"变得含糊。
+MAX_UPLOAD_BYTES = settings.UPLOAD_MAX_SIZE_MB * 1024 * 1024
+MAX_IMAGE_BYTES = settings.IMAGE_MAX_SIZE_MB * 1024 * 1024
 
 DOCUMENT_NOT_FOUND_MSG = "文档不存在"
 
@@ -69,14 +77,52 @@ def _safe_basename(raw: str | None) -> str:
     return name
 
 
-def _safe_extension(filename: str) -> str:
-    """扩展名白名单：先过字符集（挡注入），再过类型（挡不支持的格式）"""
-    ext = FsPath(filename).suffix.lstrip(".").lower()
-    if not SAFE_EXT.match(ext):
-        raise ParamError("文件扩展名不合法")
-    if ext not in ALLOWED_EXTENSIONS:
-        raise ParamError(f"不支持的文件类型 .{ext}，目前只支持 {'/'.join(sorted(ALLOWED_EXTENSIONS))}")
+def _safe_extension(filename: str, kind: str = file_types.KIND_DOCUMENT) -> str:
+    """扩展名白名单：先过字符集（挡注入），再过类型（挡不支持的格式）
+
+    具体判定全部委托 app/services/file_types.py —— 文档车道和图片车道共用同一套规则，
+    不在这里写第二份 if。
+    """
+    try:
+        ext = file_types.normalize_extension(filename)
+        if not SAFE_EXT.match(ext):
+            raise ParamError("文件扩展名不合法")
+        file_types.mime_of(ext, kind)      # 不在白名单里 → UnsupportedFormatError
+    except UnsupportedFormatError as exc:
+        raise ParamError(str(exc)) from exc
     return ext
+
+
+async def _guard_upload_body(file: UploadFile, ext: str, *, max_bytes: int, kind: str) -> tuple[str, int]:
+    """内容边界：流式算 sha256 的同时卡体积上限，并嗅探前若干字节核对后缀
+
+    返回 (file_hash, file_size)。三道闸的顺序很讲究：
+      1. 体积在**读取过程中**判，绝不相信 Content-Length —— 那玩意客户端想写多少写多少，
+         信它就会出现"报 1KB 实际 5GB"先把磁盘吃光再报错；
+      2. 空文件（0 字节）单独拒：它进了库只会变成一条永远解析失败的记录，
+         前端看到 failed 还以为系统坏了；
+      3. 内容嗅探只在超限之后做（读 16 字节，不为嗅探读整个文件）。
+    """
+    try:
+        file_hash, file_size = await calculate_document_hash(file, max_bytes=max_bytes)
+    except BusinessError:
+        raise  # 413 原样出去，别在这里改文案
+
+    if file_size == 0 and settings.UPLOAD_REJECT_EMPTY:
+        raise ParamError("文件是空的（0 字节），没有可入库的内容")
+
+    await file.seek(0)
+    head = await file.read(settings.UPLOAD_SNIFF_BYTES)
+    await file.seek(0)
+    try:
+        mismatch = file_types.sniff_mismatch(ext, head)
+    except UnsupportedFormatError as exc:
+        raise ParamError(str(exc)) from exc
+    if mismatch:
+        raise ParamError(mismatch)
+
+    _ = kind  # 预留：将来图片车道要按 kind 做更严的嗅探（比如解码一次确认是完整图片）
+    return file_hash, file_size
 
 
 def _cleanup_plan(document, kb_owner_id) -> tuple[str, str] | None:
@@ -178,7 +224,8 @@ async def upload_document(
     current_user: CurrentUser,
     access: KBWriter,
     db: DB,
-    file: Annotated[UploadFile, File(description="要上传的文档（" + " / ".join(sorted(ALLOWED_EXTENSIONS)) + "）")],
+    file: Annotated[UploadFile, File(description="要上传的文档（" + " / ".join(sorted(ALLOWED_EXTENSIONS))
+                                     + f"），单文件不超过 {settings.UPLOAD_MAX_SIZE_MB}MB")],
     kb_id: Annotated[str, Query(description="所属知识库ID")],
     document_name: Annotated[str | None, Query(description="文档标题，不传则用原文件名（去扩展名）")] = None,
 ):
@@ -196,8 +243,9 @@ async def upload_document(
            再过白名单（pdf/md/docx）→ 不合法 400；
         2. 归属边界：kb_id 是客户端传的，必须校验「存在 + 属于当前用户」，
            否则就能把文件塞进别人的知识库 → 不通过 404（和不存在同一响应，不透露归属）；
-        3. 内容边界：流式算 sha256 并在读取过程中卡 20MB 上限（不能信 Content-Length），
-           超限 413；算完把指针拨回 0，落盘还要从头拷；
+        3. 内容边界：流式算 sha256 并在**读取过程中**卡 UPLOAD_MAX_SIZE_MB 上限
+           （不能信 Content-Length），超限 413；空文件 400；再读 16 字节嗅探内容与后缀
+           是否一致（伪装成 .md 的可执行文件在这一步被挡）；算完把指针拨回 0，落盘还要从头拷；
         4. 判重：按 uq(kb_id, file_hash) 的口径在**同一个知识库内**判重，重复直接 409，
            一个字节都不再写；
         5. 先生成 document_id 再落盘（文件名要用它），写文件放线程池，避免阻塞事件循环；
@@ -215,8 +263,10 @@ async def upload_document(
     # 2. 知识库权限边界（require_kb_access("write") 已经做完：不存在→404，只读授权→403）
     kb = access.kb
 
-    # 3. 内容指纹 + 体积上限
-    file_hash, file_size = await calculate_document_hash(file, max_bytes=MAX_UPLOAD_BYTES)
+    # 3. 内容边界：体积上限（配置项）+ 空文件 + 后缀与内容是否对得上
+    file_hash, file_size = await _guard_upload_body(
+        file, ext, max_bytes=MAX_UPLOAD_BYTES, kind=file_types.KIND_DOCUMENT
+    )
 
     # 4. 同库判重（先查重再写盘，重复文件不会留下垃圾）
     if await document_crud.get_document_by_hash(kb.id, file_hash, db) is not None:
@@ -484,3 +534,152 @@ async def document_status(
         healthy=healthy,
     )
     return ApiResponse.ok(data, msg=msg)
+
+
+# ======================= 图片上传（多模态/OCR 预留车道） =======================
+
+
+@router.post("/image/upload", response_model=ApiResponse[DocumentResponse], summary="上传图片")
+async def upload_image(
+    current_user: CurrentUser,
+    access: KBWriter,
+    db: DB,
+    file: Annotated[UploadFile, File(description="图片（" + " / ".join(sorted(IMAGE_EXTENSIONS))
+                                     + f"），单张不超过 {settings.IMAGE_MAX_SIZE_MB}MB")],
+    kb_id: Annotated[str, Query(description="所属知识库ID")],
+    image_name: Annotated[str | None, Query(description="图片标题，不传则用原文件名（去扩展名）")] = None,
+):
+    """
+    显示需求：后端要保留一个上传图片的接口（手机化之后相册是主要来源之一）。
+
+    **这一条是「存得住、取得回」，不是「看得懂」**：
+        图片不参与文本解析、不进切块、不进向量库 —— 所以 status 直接是 `stored`，
+        不是 pending。为什么不是 pending：pending 会被重索引逻辑捞出来跑解析，图片解析必失败，
+        白白变成一条 failed + 一句误导性的 error_msg（用户以为系统坏了）。
+        OCR / 多模态问答接上之后再把它推进解析流，那是 TODO.md §8 的事。
+
+    和图片车道一起复用的是同一套东西：路径规则（document_storage_path）、权限（KBWriter）、
+    体积/嗅探闸门（_guard_upload_body）、下载与删除（/download /delete）。
+    也就是说前端接这个接口不需要学第二套约定。
+    """
+    original_name = _safe_basename(file.filename)
+    ext = _safe_extension(original_name, file_types.KIND_IMAGE)
+
+    kb = access.kb
+    file_hash, file_size = await _guard_upload_body(file, ext, max_bytes=MAX_IMAGE_BYTES, kind=file_types.KIND_IMAGE)
+
+    # 同库判重：一张图重复传两次同样是浪费手机流量和磁盘，语义与文档车道一致
+    if await document_crud.get_document_by_hash(kb.id, file_hash, db) is not None:
+        raise ConflictError("该图片已在此知识库中，未重复入库")
+
+    document_id = uuid.uuid4()
+    stored_path = document_storage_path(kb.owner_id, current_user.id, kb.id, document_id, ext)
+    try:
+        await run_in_threadpool(
+            new_document_file_path,
+            file,
+            str(kb.owner_id),
+            str(current_user.id),
+            str(kb.id),
+            str(document_id),
+            ext,
+        )
+    except OSError as exc:
+        # from exc 把原始异常挂在下面，堆栈里看得见是 EACCES 还是 ENOSPC；
+        # 对外仍然只给一句人话 —— 磁盘错误种类太多，别把路径和 errno 透给客户端。
+        # （和上面文档车道同一个口径：本文件的 OSError 分支都不打日志，等 P1 接统一日志再一起补）
+        raise BusinessError("图片保存失败，请稍后重试", status=500) from exc
+
+    try:
+        document = await document_crud.create_document(
+            kb_id=kb.id,
+            owner_id=current_user.id,
+            title=(image_name or FsPath(original_name).stem)[:255],
+            filename=original_name[:255],
+            file_path=stored_path,
+            file_size=file_size,
+            mime_type=IMAGE_EXTENSIONS[ext],
+            file_hash=file_hash,
+            db=db,
+            document_id=document_id,
+            status=DocStatus.STORED,
+        )
+    except Exception as exc:
+        await _cleanup_uploaded_file(kb.owner_id, current_user.id, kb.id, document_id, ext)
+        raise BusinessError("图片入库失败，已回滚", status=500) from exc
+
+    if document is None:
+        await _cleanup_uploaded_file(kb.owner_id, current_user.id, kb.id, document_id, ext)
+        raise ConflictError("图片入库失败，请重试")
+
+    # 刻意**不**丢后台任务：图片没有可解析的文字，跑一遍解析只会变 failed
+    return ApiResponse.ok(DocumentResponse.model_validate(document), msg="上传成功")
+
+
+# ======================= 失败重跑入口（§3 的尾巴） =======================
+
+
+@router.post("/reindex/{document_id}", response_model=ApiResponse[DocumentStatusOut], summary="重新解析入库单篇文档")
+async def reindex_document(
+    document_id: Annotated[uuid.UUID, Path(description="文档ID，必须是 uuid")],
+    background_tasks: BackgroundTasks,
+    current_user: CurrentUser,
+    db: DB,
+):
+    """
+    显示需求：status=failed 的文档现在没有重跑入口，只能删了重传。
+
+    落地：
+        1. 权限走 kb_access.document_access（共享库里别人传的文档，write 授权的人也能重跑）；
+        2. 只有 read 权限 → 403；文档不存在/已删 → 404，和文档其他接口同一口径；
+        3. 接口**立刻返回**，不等解析结果：一篇 PDF 全文解析几秒起步，
+           重跑还是走后台任务，前端轮询 GET /documents/status 看结果（与上传同一套语义）；
+        4. stored（图片）不拒绝但也不会解析 —— 直接返回当前状态并说明原因，
+           别让它进解析流变成 failed。
+
+    为什么返回体是 DocumentStatusOut 而不是新的 schema：重跑之后用户关心的就是
+    「现在什么状态、几篇还没好」，用同一个形状前端只写一份轮询逻辑。
+    """
+    document = await document_crud.get_document_any(document_id, db)
+    if document is None:
+        raise NotFoundError(DOCUMENT_NOT_FOUND_MSG)
+
+    access = await kb_access.document_access(document, current_user.id, db)
+    if access is None or not access.can_read:
+        raise NotFoundError(DOCUMENT_NOT_FOUND_MSG)
+    if not access.can_write:
+        raise ForbiddenError("需要知识库的读写（write）权限才能重新解析文档")
+
+    if document.status == DocStatus.STORED:
+        # 图片这类"落盘但不解析"的资源：重跑解析只会得到 failed，明确拒绝比默默失败好
+        counts = await document_crud.count_by_status(document.kb_id, db)
+        return ApiResponse.ok(
+            DocumentStatusOut(
+                kb_id=document.kb_id,
+                kb_version=access.kb.version,
+                document_total=sum(counts.values()),
+                status_counts={str(key): value for key, value in counts.items()},
+                missing_files=[],
+                orphan_files=[],
+                healthy=True,
+            ),
+            msg="该资源不参与文本解析（图片/多媒体），无需重跑",
+        )
+
+    # 先把状态拨回 pending：前端立刻能看到"已经在重跑了"，而不是等后台任务改状态
+    await document_crud.update_status(document, DocStatus.PENDING, db, error_msg=None)
+    background_tasks.add_task(process_document, str(document.id), force=True)
+
+    counts = await document_crud.count_by_status(document.kb_id, db)
+    return ApiResponse.ok(
+        DocumentStatusOut(
+            kb_id=document.kb_id,
+            kb_version=access.kb.version,
+            document_total=sum(counts.values()),
+            status_counts={str(key): value for key, value in counts.items()},
+            missing_files=[],
+            orphan_files=[],
+            healthy=True,
+        ),
+        msg="已提交重新解析，请轮询 /documents/status 查看结果",
+    )

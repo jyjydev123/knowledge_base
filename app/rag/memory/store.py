@@ -44,7 +44,15 @@ PROMPT_HEADER = "以下是与当前问题相关的长期记忆（历史对话资
 
 
 def _build_backend() -> MemoryBackend:
-    """按配置选后端；pgvector 车道连不上时退回 local，而不是让接口 500"""
+    """按配置选后端。**pgvector 是唯一的生产车道，连不上就不记，绝不退回 local**
+
+    为什么把"自动退 local"这条去掉（2026-11-19 的决定）：
+        降级到本地 JSONL 意味着同一套业务在有 PG 的机器和没 PG 的机器上
+        **长成两个样子、存成两份数据**，而两边都不报错。用户视角是"记忆有时候记得
+        有时候不记得"，日志里干净得像没出过问题。现在的答案是：
+        连不通 → NullBackend（明确不记）+ 一条 warning + `/health` 里写原因。
+    真要用 local 车道只有一种场景：`MEMORY_BACKEND=local` 显式写出来（离线自测/单测）。
+    """
     backend_name = settings.MEMORY_BACKEND
     if backend_name == "off":
         return NullBackend()
@@ -53,9 +61,15 @@ def _build_backend() -> MemoryBackend:
 
         # PgVectorBackend 是懒连接的，构造成功不代表能用；真跑不通在第一次读写时降级
         return PgVectorBackend()
-    from app.rag.memory.local import LocalJsonBackend
+    if backend_name == "local":
+        from app.rag.memory.local import LocalJsonBackend
 
-    return LocalJsonBackend(root=f"{settings.MEMORY_DIR}/local", dedupe_threshold=settings.MEMORY_DEDUP_THRESHOLD)
+        return LocalJsonBackend(
+            root=f"{settings.MEMORY_DIR}/local", dedupe_threshold=settings.MEMORY_DEDUP_THRESHOLD
+        )
+    # 配置写错（比如手抖打了 pg）时**不要猜成 local**：静默选错后端正是上面那段要避免的事
+    logger.warning("MEMORY_BACKEND=%r 不是合法取值，长期记忆按不记处理（可用: pgvector/local/off）", backend_name)
+    return NullBackend()
 
 
 class LongTermMemory:

@@ -14,6 +14,7 @@
 | ORM | SQLAlchemy **2.0/2.1 风格**：`Mapped[...]` + `mapped_column(...)`，禁止旧 `Column()` 写法 |
 | 校验 | Pydantic **v2**（`ConfigDict` / `field_validator`），禁止 v1 的 `class Config: orm_mode` |
 | 数据库 | PostgreSQL + pgvector；驱动 `asyncpg`（异步必需 `greenlet`） |
+| 缓存 | Redis（`redis` 包，旁路 cache-aside，**可选依赖**：没装/连不上都自动回源数据库） |
 | 测试 | pytest + `fastapi.testclient.TestClient` + 临时文件 SQLite（不依赖本机 PG） |
 | 启动 | 项目根执行 `./start.sh`（= `uvicorn app.main:app --reload`） |
 | 建表 | **`scripts/init_db.py`**（`--drop` / `--check` / `--snapshot`），表结构真源是 `app/db/models.py` |
@@ -29,7 +30,9 @@ api（路由/依赖）  →  schemas（入参出参）  →  services（业务�
 - **CRUD（`app/db/crud/*`）不抛 HTTP 异常**：查不到返回 `None`，唯一索引冲突 `except IntegrityError: await db.rollback(); return None`，由路由决定提示语。
 - **service 层不碰 Session 之外的东西**：纯函数优先（chunker、prompt、解析器），方便单测。
 - **切块/向量归 `app/services/`，不要放回 `app/rag/`**：
-  `chunker.py`（纯函数切块）、`vector_index.py`（chunks → pgvector）、`text_metrics.py`（token 估算）
+  `chunker.py`（纯函数切块）、`vector_index.py`（chunks → pgvector）、`text_metrics.py`（token 估算）、
+  `file_types.py`（上传类型策略：两套白名单 + 魔数嗅探，**两条上传车道共用**）、
+  `user_cache.py`（用户身份旁路缓存，只读/写两个入口）
   都是业务算法层，和 `parsers/` 同层；`app/rag/` 只放**模型侧**（llm、memory、output、chat 服务编排）。
   文档向量与用户记忆向量是两回事： collection 必须分开（`DOCUMENT_VECTOR_COLLECTION` vs
   `MEMORY_PG_COLLECTION`），混在一个 collection 里检索会互相命中、按文档清理向量会连带删掉记忆。
@@ -57,8 +60,18 @@ api（路由/依赖）  →  schemas（入参出参）  →  services（业务�
   `retrieval.py`=**检索**（召回与算分，返回形状与向量版一致），`generation.py`=在跑生成的**进程内注册表**（/stop）。
   路由只调 `build_turn` + `stream_turn`/`answer_turn`，不碰 langchain、不拼 prompt。
 - **检索必须带范围**：`retrieval.retrieve()` 的 `kb_ids` 由调用方给（会话的库或 `kb_access.accessible_kb_ids()`），
-  空范围返回空结果而不是"全库"。任何新增检索车道都要把这条写进测试 —— 越权是这类系统最常见的洞。
+  空范围返回空结果而不是"全库"。任何新增检索车道都要把这条写进测试 —— 越权是这类系统最常见的洞
+  （向量车道已有这条测试：`kb_ids` 为空时**一次都不许问向量库**，见 `tests/test_vector_retrieval.py`）。
+- **换检索车道只改 `retrieval.py` 内部**：`RetrievedContext(text/sources/mode)` 就是契约，
+  路由、`answer.py`、前端的引用角标都不动车道就能换。新车道必须同时交三样：
+  ① 命中来源标记（`sources[].lane`）、② 不可用时的显式降级（`fallback` 带原因）、③ 上面那条范围测试。
 - 包内**不放 `__init__.py`**（PEP 420 命名空间包），导入一律写全路径：`from app.db.crud import user_crud`。
+- **缓存不是新的一层，是各处的一小节**：`app/core/cache.py` 只放"客户端 + 三条纪律"，
+  具体缓存什么写在对应 service 里（`user_cache.py` 缓存用户身份）。
+  不要把业务判断塞进 core，也不要在路由里直接 import redis 客户端。
+- **同一模块里的组装函数必须带上类型名**（`_kb_to_out` / `_share_to_out`）。
+  两个同名 `_to_out` 后者会静默覆盖前者，症状是接口报
+  `AttributeError: 'KnowledgeBase' object has no attribute 'kb_id'`（本项目实测踩过）。
 
 ## 3. 接口规范
 
@@ -213,6 +226,16 @@ data: {"status":200,"msg":"chunk","data":{"text":"你好"}}
 - 让旧 token 失效的动作：登出删单条、改密/改邮箱删该用户全部（`token_crud.revoke_all_user_tokens`）、注销级联清除。
 - 密码只能 `get_password_hash` 入库；校验用 `verify_password`；日志/返回体禁止出现密码、`access_token`、`SECRET_KEY`。
 - `SECRET_KEY` 生产用随机值（`python -c "import secrets;print(secrets.token_urlsafe(48))"`）；生产 `APP_DEBUG=False`（为 True 时 500 会把异常细节回给客户端）；配置项一律带项目前缀语义 —— **别用裸 `DEBUG` 这种通用名**，本机 shell 里的 `DEBUG=release` 就能把应用炸掉、`CORS_ORIGINS` 收敛成具体域名。
+- **向量库的 metadata 只能用来缩小召回，不能用来授权**。过滤条件按 `kb_id ∈ 可读库`，
+  **绝不按当前 `user_id` 过滤**：向量里那个 `user_id` 是文档的 owner（库主人），
+  按提问者过滤会让共享库/public 库永远检索不到（症状是"文档列得出来、搜不到内容"，比越权难查）。
+  真正的授权在两层：调用方给的 `kb_ids` 来自 `kb_access`，以及召回后**回 chunks 表再按 `kb_ids` 校验一次**
+  （`chunk_crud.list_chunks_by_ids`，顺带把软删文档的脏向量挡掉）。
+- **缓存绝不能存安全属性**：`hashed_password` 不进任何外部存储；
+  **token 是否被吊销永远查库**。任何"把鉴权结果缓存起来"的改动都要先回答
+  "登出之后多久失效"这个问题 —— 答案必须是"立刻"。
+  因此 `get_current_user` 只缓存身份字段，而**改用户的写路由一律走 `user_cache.load_for_write`**
+  （只读车道命中缓存时返回的是 transient 实例，改它等于改了个影子）。
 - **权限判定只有一个入口**：`app/services/kb_access.py`。
   - 依赖注入：`KBReader` / `KBWriter` / `KBManager`（工厂 `require_kb_access(mode)`，`kb_id` 自动从路径或 query 取）；
   - 资源级判定：`kb_access.document_access(document, user_id, db)`；
@@ -255,6 +278,10 @@ data: {"status":200,"msg":"chunk","data":{"text":"你好"}}
 
 - 新配置项必须同时改三处：`app/core/config.py`（字段+默认值）、`.env.example`（注释说明）、`README.md`（若是用户可感知开关）。
 - 不在代码里硬编码密钥、URL、模型名、维度、阈值；魔法数字要提成模块常量并注释来由（如 `PASSWORD_MAX_LENGTH = 72`）。
+- **不可逆的配置在启动时就拦住**（`model_validator(mode="after")`），别等第一次写数据才炸：
+  embedding 维度（`DASHSCOPE_EMBEDDING_DIMS` 白名单）和批量上限（`EMBEDDING_BATCH_SIZE <= 10`）就是这么做的。
+  同理，**默认值必须是"最保守但必定可用"的那条**：`RETRIEVAL_LANE` 默认 `keyword`，
+  填了 key 也不会悄悄改变线上行为 —— 开关的默认值改变行为，等于把故障埋进别人的提交里。
 - `.env` 永不提交（`.gitignore` 已含）；`Settings` 允许空值回退默认，保证「没配数据库也能 import 起服务/生成文档」。
 
 ## 8. 代码风格
@@ -314,22 +341,37 @@ data: {"status":200,"msg":"chunk","data":{"text":"你好"}}
 | 位置 | 情况 | 处理建议 |
 | --- | --- | --- |
 | `userrouter.py` | `POST /update·/delete·/reset_password` 非 REST | 历史遗留，保留兼容；新模块用 REST（`/documents` 已在用 `DELETE`） |
-| `documentrouter.py` | `GET /detail`、`GET /status` 用 query 参数、`DELETE /delete/{id}` 路径重复动词 | M1 实现时收敛成 `GET /documents/{id}`、`DELETE /documents/{id}` |
-| `documentrouter.py`、`aichatrouter.py` | 文档 6 条、对话 8 条全部实现 | 仍卡在做 M0 知识库 CRUD：没有 HTTP 途径能建库，`upload` 与 `chat` 的 `kb_id` 都无来源 |
+| `documentrouter.py` | `GET /detail`、`GET /status` 用 query 参数、`DELETE /delete/{id}` 路径重复动词 | 历史遗留，暂不改（改了前端要跟着动）；新模块一律 REST |
+| `kbrouter.py`、`documentrouter.py`、`searchrouter.py` | **M0 已补**：33 条端点全部实现（知识库 5 + 授权 3 + 文档 8 + 对话 8 + 用户 8 + 搜索 1） | 建库/删库从此有 HTTP 途径，前端不再需要脚本建库 |
+| `kbrouter.py` 路由顺序 | `DELETE /kb/{kb_id}` 必须排在 `DELETE /kb/share` **之后**（FastAPI 按注册顺序匹配，`share` 会被当 uuid → 422） | 有防回归测试钉住；新增 `/kb/xxx` 静态 DELETE 都要写在它前面 |
+| 上传体积上限 | 已是配置项 `UPLOAD_MAX_SIZE_MB` / `IMAGE_MAX_SIZE_MB`（原 20MB 路由常量去掉） | 模块级 `MAX_UPLOAD_BYTES` 保留为生效值（测试靠 monkeypatch 它触发 413）；改 .env 后需重启进程才生效 |
+| 图片车道 | `POST /documents/image/upload` 存得下/取得回/能删，`status=stored` **不参与解析** | OCR 或多模态接上之后再推进解析流（TODO §8） |
+| `MEMORY_BACKEND` | 默认已是 `pgvector`，且 pgvector 连不上**不再自动退 local**（明确不记 + `/health` 给原因）；测试车道靠 conftest 显式钉 `local` | 短期窗口的真源在 `chat_sessions/chat_messages`，但**进程重启后的窗口重建还没做**（TODO §3） |
+| Redis 旁路缓存 | 只缓存 users 单行身份；`/health` 的 `cache` 一节如实报 `client_ready`/`last_ok`/`circuit_open`（懒连接，构造成功≠能用）；失败拉闸 10 秒，半开自动重试 | 多 worker 天然共享；`/stop` 那种进程内状态仍是 TODO §3；限流/登录锁定也复用这套（别再引 slowapi） |
 | `app/services/process_document.py` | 路径唯一来源 `document_storage_path()`；落盘/删除/列目录都带 `kb_id`，同步 IO 一律由路由 `run_in_threadpool` 调 | M2 的解析/切块也放这里，别在路由里写文件操作 |
 | `app/services/kb_access.py` | 权限矩阵与越权语义的唯一实现处 | 新增资源（会话、导出、批量操作）先接它，别自己判 owner_id |
 | `app/services/process_document.py` | 解析→切块→入库的编排在 `process_document()`，由 `/upload` 的后台任务调用（`DOCUMENT_INDEX_ON_UPLOAD` 可关） | 失败重跑入口还没有：M2 补 `POST /documents/reindex/{id}`，并处理重启时停在 parsing/chunking 的文档 |
 | `main.py` | 无日志、无请求 ID、无 429 限流 | P1 工程化补齐 |
 | `app/rag/generation.py` | `/stop` 靠进程内注册表，多 worker 之间不共享（键按 user+会话，超时会自愈顶掉僵尸键） | M9 换 Redis 广播或按会话做粘性连接；现在别把它当分布式能力 |
-| `app/rag/retrieval.py` | 只有关键词车道（LIKE 召回 + 词频算分 + 每篇文档限流），不是语义检索 | 定了 embedding 厂商与维度后加向量车道；返回形状不变，路由和前端不用改 |
+| `app/rag/retrieval.py` | 三条车道都已实现（keyword / vector / hybrid），**默认还是 keyword**：向量车道至今没连真库跑过一次 | 建完库 + 填 key 后 `scripts/index_documents.py --all`，再 `--kb <id> --query 某问题 --lane vector` 验收，然后才把 `RETRIEVAL_LANE` 切过去 |
+| `EMBEDDING_*`（百炼） | 单请求最多 10 条文本；兼容模式**没有稀疏向量** | 批量靠 `OpenAIEmbeddings.chunk_size=10` 兜住（`build_embeddings` 里显式传），别再自己拼 batch；"混合检索"= 向量 + 关键词两路按 chunk_id 合并，不要去找 pgvector 的 sparse |
+| `text-embedding-v3` 按量计费 | 每轮向量问答都在调远端，**文档片段会出网** | 手机化后"私有资料不上第三方"若成硬要求，把 `EMBEDDING_BASE_URL/MODEL/DIMS` 换成本地 Ollama `bge-m3`（1024 维，同一套代码），但维度相同 ≠ 向量空间兼容：**必须清空 collection 全库重跑** |
 | `app/api/v1/aichatrouter.py` | 会话表没有 agent 列，`/agents` 是配置常量，前端选了也不落库 | M8 给 `chat_sessions` 加 `agent` 列并把 `build_agent()` 接进 `answer.py` |
-| `chunks.embedding` | 还没有向量列（按要求先不做 pgvector） | M3 再加列 + HNSW 索引，并回填 `knowledge_bases.embedding_model/embedding_dim` |
+| `chunks.embedding` | 确认**不加**这一列：向量存在 PGVector 自己的 `langchain_pg_collection/langchain_pg_embedding` 两张表里，靠 metadata 的 `chunk_id` 对应回来 | 好处是换模型不动表结构；代价是检索必须回表（已实现）。真要加列时先想清楚"两份向量数据谁是真的" |
+| 向量检索的降级 | 车道不可用时**不许 500、也不许静默**：`search_vectors` 返回 `(hits, 原因)`，`retrieve` 退回 keyword 并把原因放进 `RetrievedContext.fallback`（`meta` 帧里前端看得见）。"正常跑了但零命中"**不算**故障，不换车道 |
 | 已修复（别当坑抄） | `aichatrouter.py` 的 8 个 `pass` 占位（实测返回 `200 + null`，前端解包必炸）→ 已实现并 include；`/agents` 一开始漏了鉴权 → 已补 `CurrentUser`；`tokens` 存 JWT 原文 → 改 sha256；`get_optional_user` 漏校验吊销 token；`/user/info?user_id=` 越权面；`init_db.sql` 与 ORM 漂移 | — |
 
-## 13. 前端与移动端形态（已拍板，实施待做）
+## 13. 前端与移动端形态（已拍板，第一版已实现）
 
 结论：**Vue 3 + Vite + TypeScript，打包成手机 App 走 Capacitor 壳（WebView）**。
-2026-11-14 定的；待办清单在 `TODO.md` §4/§5，这里只留判定依据，避免以后重新论证一遍。
+2026-11-14 定的；**2026-11-26 前端第一版落地**（`frontend/src/`：api 层 4 个文件 + 6 个页面 + 4 个组件，
+`npm run build` 与 `vue-tsc` 全绿）。待办清单在 `TODO.md` §4/§5，这里只留判定依据，避免以后重新论证一遍。
+
+前端自己的分层规矩（和后端同构，别把逻辑写进 .vue 里）：
+    `src/api/client.ts` 唯一出网口（信封解包 + 401 + Authorization）→
+    `src/api/endpoints.ts` 一条端点一个函数 → `src/api/sse.ts` 流式协议 →
+    `views/*.vue` 只编排交互，`stores/` 只放纯 UI/登录态，服务端状态交给 vue-query。
+    唯一允许 `v-html` 的地方是 `components/MarkdownBlock.vue`（marked → DOMPurify → 插入）。
 
 | 做法 | 出 APK | 文件/相册选择 | 系统通知 | 返回键/生命周期 | 存储持久 | 代价 |
 | --- | :-: | :-: | :-: | :-: | :-: | --- |

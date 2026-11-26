@@ -14,6 +14,23 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 DEFAULT_DATABASE_URL = "postgresql+asyncpg://postgres:postgres@127.0.0.1:5432/knowledge_base"
 DEFAULT_SECRET_KEY = "dev-only-secret-key-please-change-me"
 
+# 阿里云百炼（DashScope）的 OpenAI 兼容端点：embedding 模型默认走这里。
+# 换区域/换站点只改这一个常量或 .env 里的 EMBEDDING_BASE_URL：
+#   国际站 https://dashscope-intl.aliyuncs.com/compatible-mode/v1
+#   专属域名 https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+DEFAULT_EMBEDDING_BASE_URL = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+
+# 通义 text-embedding-v3/v4 允许的向量维度（v4 比 v3 多 1536/2048 两档）。
+# 维度是**不可逆**的：collection 一旦写过向量就定死了，改维度必须连 EMBEDDING_DIMS
+# 带 collection 名一起换。所以这里在启动时就拦，而不是等第一次插入报维度不一致。
+DASHSCOPE_EMBEDDING_DIMS: dict[str, tuple[int, ...]] = {
+    "text-embedding-v3": (64, 128, 256, 512, 768, 1024),
+    "text-embedding-v4": (64, 128, 256, 512, 768, 1024, 1536, 2048),
+}
+# 一次 embedding 请求最多带几条文本：v3/v4 都是 10 条，超了直接 400。
+# langchain 的 OpenAIEmbeddings 默认 chunk_size=1000，不显式改就必踩这个坑。
+DASHSCOPE_EMBEDDING_BATCH_LIMIT = 10
+
 # 占位 key 的样子：your_api_key_here / sk-xxxx / changeme 这类。
 # 认成「未配置」很重要 —— 否则开发期每个请求都真去连一次远端、拿一个 401，
 # 慢且 noisy，还容易被误判成"网络或模型有问题"。
@@ -57,8 +74,9 @@ class Settings(BaseSettings):
     ADMIN_USERNAMES: str = "admin"
 
     # ---------------- LLM（对话模型）----------------
-    # 对话模型和向量模型**通常不是同一家**：DeepSeek 只提供 chat，没有 embedding 接口，
-    # 长期记忆的向量要么另配一家（硅基流动 / 通义 / OpenAI），要么本地跑一个。
+    # 对话模型和向量模型**是两件事、通常也是两家**：DeepSeek 只提供 chat，没有 embedding 接口，
+    # 所以本项目 embedding 固定走阿里云百炼的 OpenAI 兼容模式（text-embedding-v3）。
+    # 两组字段各自独立：LLM_* 管问答，EMBEDDING_* 管向量化与向量检索。
     # 两个字段都留了旧名字的别名（OPENAI_API_KEY / OPENAI_BASE_URL），app/rag 里沿用老写法也能读到。
     LLM_API_KEY: str = Field(
         default="",
@@ -76,18 +94,26 @@ class Settings(BaseSettings):
         default="",
         validation_alias=AliasChoices("EMBEDDING_API_KEY", "OPENAI_EMBEDDING_API_KEY"),
     )
+    # 默认端点已经是百炼兼容模式：只要填一个 EMBEDDING_API_KEY 就能跑，
+    # 想换 OpenAI 本体/别的兼容网关就把这里改成对方的 /v1。
     EMBEDDING_BASE_URL: str = Field(
-        default="",
+        default=DEFAULT_EMBEDDING_BASE_URL,
         validation_alias=AliasChoices("EMBEDDING_BASE_URL", "OPENAI_EMBEDDING_BASE_URL"),
     )
-    EMBEDDING_MODEL: str = "text-embedding-3-small"
-    EMBEDDING_DIMS: int = 1536             # 一旦建过库就不能改，改维度要重建 collection
+    EMBEDDING_MODEL: str = "text-embedding-v3"
+    EMBEDDING_DIMS: int = 1024             # 一旦建过库就不能改，改维度要重建 collection
+    # 每次 embedding 请求带的文本条数。百炼 v3/v4 的上限是 10（见上面常量），
+    # 这里必须 <= 上限；VECTOR_INDEX_BATCH_SIZE 是"一批多少条切块"，两者是不同的层。
+    EMBEDDING_BATCH_SIZE: int = DASHSCOPE_EMBEDDING_BATCH_LIMIT
 
     # ---------------- 长期记忆（跨会话，按 user_id 隔离）----------------
-    # local    = 本地 JSONL + 词面 hash 向量：开发/测试车道，不联网、不建库、不装 pgvector
-    # pgvector = langchain_postgres.PGVector：生产车道，需要 PG 库 + pgvector 扩展 + embedding 服务
+    # 默认 **pgvector**：长期记忆只认 PostgreSQL 一条路（业务要求：不留第二份记忆数据）。
+    # pgvector = langchain_postgres.PGVector：真语义向量，需要 PG 库 + pgvector 扩展 + EMBEDDING_API_KEY
     # off      = 全链路 no-op（灰度或不想让记忆进 prompt 时用）
-    MEMORY_BACKEND: Literal["local", "pgvector", "off"] = "local"
+    # local    = 本地 JSONL + 词面 hash：**仅供离线自测**，不是生产选项，也**不再是任何降级的目标**。
+    #            以前 pgvector 连不上会自动退 local，那等于"生产上悄悄换了套记忆存储"，
+    #            两份数据两套行为，是最难发现的一类问题；现在连不上就明确不记（见 memory_lane_block_reason）。
+    MEMORY_BACKEND: Literal["local", "pgvector", "off"] = "pgvector"
     MEMORY_DIR: str = "data/memory"
     MEMORY_TOP_K: int = 3
     MEMORY_SCORE_THRESHOLD: float = 0.5    # 低于这个相似度不进 prompt；调高会漏，调低会混噪音
@@ -99,6 +125,27 @@ class Settings(BaseSettings):
     # 知识库文档向量的 collection（与记忆分开，见 app/rag/memory/save.py 的说明）
     DOCUMENT_VECTOR_COLLECTION: str = "kb_documents"
     VECTOR_INDEX_BATCH_SIZE: int = 64
+
+    # ---------------- 上传限制（手机端必须卡死）----------------
+    # 为什么不是"前端限制了就行"：客户端的限制只是体验优化，服务端才是唯一有效的闸。
+    # 移动网络上传大文件失败的代价（用户等 3 分钟然后 413）远高于拒收一个 21MB 的文件。
+    UPLOAD_MAX_SIZE_MB: int = 20        # 文档（pdf/docx/pptx/md/txt）
+    IMAGE_MAX_SIZE_MB: int = 8          # 图片（jpg/png/webp/gif/bmp）：多模态问答预留的车道
+    # 内容嗅探读多少个字节就够（只对齐 magic number，绝不为嗅探而读完整文件）
+    UPLOAD_SNIFF_BYTES: int = 16
+    # 空文件（0 字节）默认拒收：它进库只会变成一条永远解析失败的记录
+    UPLOAD_REJECT_EMPTY: bool = True
+
+    # ---------------- Redis（旁路缓存 cache-aside）----------------
+    # 铁律：缓存只当**加速器**，永远不是数据源。连不上/超时/键没有，一律回源数据库，
+    # 且**绝不因为缓存失败而让接口报错**（fail-open）。反过来，写操作必须先落库再删键，
+    # 顺序反了就会留下"库里改了、缓存还是旧的"这种最难查的 bug。
+    REDIS_ENABLED: bool = True          # False = 整套缓存旁路直接关掉，行为退回纯数据库
+    REDIS_URL: str = "redis://127.0.0.1:6379/0"
+    REDIS_SOCKET_TIMEOUT_SECONDS: float = 0.5   # 比一次数据库查询还慢的缓存不如不要
+    REDIS_MAX_CONNECTIONS: int = 20
+    CACHE_KEY_PREFIX: str = "kb"        # 所有键都带这个前缀，清缓存时能按前缀扫，不会误伤同机其它应用
+    USER_CACHE_TTL_SECONDS: int = 300   # 用户身份缓存的存活时间；改密/禁用/注销都会立刻删键
 
     # ---------------- 文档索引（M2 后半）----------------
     # 上传成功后是否立刻丢给 BackgroundTasks 解析切块。
@@ -123,6 +170,16 @@ class Settings(BaseSettings):
     CHAT_RETRIEVAL_TOP_K: int = 4          # 进 prompt 的资料块数（比 MEMORY_TOP_K 大一点：文档片段更碎）
     CHAT_RETRIEVAL_MAX_CHARS: int = 4000   # 资料总长上限，超了从后往前丢，防止一个长块吃掉整个窗口
     CHAT_SNIPPET_CHARS: int = 320          # 单块进 prompt 的截断长度（引用列表里也是这个）
+    # ---------------- 检索车道 ----------------
+    # keyword = 只在 DB 里做词面 ILIKE + 词频排序：不联网、不依赖 pgvector，永远可用
+    # vector  = 只走 pgvector 语义召回（需要 EMBEDDING_API_KEY + PostgreSQL）
+    # hybrid  = 两路都跑，按 chunk_id 去重合并（召回最全，代价是两倍延迟）
+    # 默认仍是 keyword：填了 embedding key 也不自动改变线上行为，切车道是**显式决定**；
+    # 车道不可用时（没 key / SQLite / 远端失败）会退回 keyword 并在 mode 里如实标记。
+    RETRIEVAL_LANE: Literal["keyword", "vector", "hybrid"] = "keyword"
+    # 向量召回的相似度下限（COSINE 归一到 0~1，0=不过滤）。调高会漏，调低会混噪音进来。
+    RETRIEVAL_MIN_SCORE: float = 0.0
+
     CHAT_STREAM_HEARTBEAT_SECONDS: float = 15.0  # 0=不发心跳；反代/手机的空闲超时一般 30~60s
     CHAT_AUTO_TITLE_CHARS: int = 30        # 首轮用问题自动命名时截取多少个字符
     # 僵尸生成：上一路流要是被硬杀且没走到 finally，这一路会一直占着"该会话正在生成"的键。
@@ -160,16 +217,38 @@ class Settings(BaseSettings):
         for name, default in (
             ("LLM_BASE_URL", "https://api.deepseek.com/v1"),
             ("LLM_MODEL", "deepseek-chat"),
-            ("EMBEDDING_MODEL", "text-embedding-3-small"),
+            ("EMBEDDING_MODEL", "text-embedding-v3"),
+            ("EMBEDDING_BASE_URL", DEFAULT_EMBEDDING_BASE_URL),
             ("MEMORY_DIR", "data/memory"),
             ("MEMORY_PG_COLLECTION", "long_term_memory"),
         ):
             value = getattr(self, name)
             if value is None or not str(value).strip():
                 setattr(self, name, default)
-        # pgvector 后端连不了 sqlite，配置写错了就自动降级，别让应用起不来
-        if self.MEMORY_BACKEND == "pgvector" and self.DATABASE_URL.startswith("sqlite"):
-            self.MEMORY_BACKEND = "local"
+        return self
+
+    @model_validator(mode="after")
+    def _check_embedding_setup(self):
+        """embedding 模型的两个硬约束放在启动时查，别等第一次写向量才炸
+
+        维度选错 = 往库里写不可逆的脏数据；批量超限 = 每个请求都 400。
+        两者都是配置写错，当场报错比运行时慢慢漏出来好查得多。
+        """
+        allowed = DASHSCOPE_EMBEDDING_DIMS.get(self.EMBEDDING_MODEL)
+        if allowed is not None and self.EMBEDDING_DIMS not in allowed:
+            raise ValueError(
+                f"EMBEDDING_MODEL={self.EMBEDDING_MODEL} 只支持这些维度 {allowed}，"
+                f"当前 EMBEDDING_DIMS={self.EMBEDDING_DIMS}；"
+                "注意维度一旦建过 collection 就不能改，换维度要换一个 collection 名重建"
+            )
+        limited = self.EMBEDDING_MODEL in DASHSCOPE_EMBEDDING_DIMS
+        if limited and self.EMBEDDING_BATCH_SIZE > DASHSCOPE_EMBEDDING_BATCH_LIMIT:
+            raise ValueError(
+                f"EMBEDDING_BATCH_SIZE={self.EMBEDDING_BATCH_SIZE} 超过百炼的单请求上限 "
+                f"{DASHSCOPE_EMBEDDING_BATCH_LIMIT}（超过会被服务端直接 400）"
+            )
+        if self.EMBEDDING_BATCH_SIZE < 1:
+            raise ValueError("EMBEDDING_BATCH_SIZE 至少是 1")
         return self
 
     @property
@@ -204,6 +283,33 @@ class Settings(BaseSettings):
     @property
     def embedding_ready(self) -> bool:
         return self._usable_key(self.EMBEDDING_API_KEY)
+
+    @property
+    def embedding_is_dashscope(self) -> bool:
+        """当前 embedding 模型是不是百炼的 v3/v4（影响 dimensions 参数与批量上限）"""
+        return self.EMBEDDING_MODEL in DASHSCOPE_EMBEDDING_DIMS
+
+    @property
+    def memory_lane_block_reason(self) -> str:
+        """长期记忆这条车道**不能真跑**的原因；空串 = 可以跑
+
+        存在的意义是"降级可见"：连不上 PG 时行为是不记（不是偷偷换成本地文件），
+        但运维必须能从 /health 一眼看出为什么不记，否则线上会一直以为记忆在生效。
+        """
+        if self.MEMORY_BACKEND == "off":
+            return "MEMORY_BACKEND=off，长期记忆整条链路不记"
+        if self.MEMORY_BACKEND == "local":
+            return "MEMORY_BACKEND=local 是离线自测车道：记忆只写本机 JSONL，多 worker/线上都不通用"
+        if self.DATABASE_URL.startswith("sqlite"):
+            return "MEMORY_BACKEND=pgvector 但 DATABASE_URL 是 SQLite：长期记忆不记（请换 PostgreSQL）"
+        if not self.embedding_ready:
+            return "MEMORY_BACKEND=pgvector 但没配 EMBEDDING_API_KEY：长期记忆不记"
+        return ""
+
+    @property
+    def vector_lane_ready(self) -> bool:
+        """向量检索/向量入库这条路现在能不能真跑（缺 key 或连的是 SQLite 就不行）"""
+        return self.embedding_ready and not self.DATABASE_URL.startswith("sqlite")
 
     @property
     def cors_origin_list(self) -> list[str]:

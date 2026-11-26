@@ -170,8 +170,69 @@ async def search_chunks(kb_ids, terms, db: AsyncSession, *, candidate_limit: int
     return hits
 
 
+async def list_chunks_by_ids(chunk_ids, kb_ids, db: AsyncSession) -> list[dict]:
+    """向量车道回表取正文：给一批 chunk_id，拿回和 search_chunks **完全同形状**的字典
+
+    为什么向量检索还要回这张表，而不是直接用 pgvector 里存的 page_content：
+      1. **正文只有一个真源**。向量表里的文本是入库当时的快照，改标题、重新切块、
+         清洗正文时两边迟早对不上；召回只需要向量给"哪些块最像"，内容以 chunks 为准。
+      2. **权限必须以业务表为准**。向量 metadata 里的 kb_id 是写进去的，不能当授权依据；
+         这里按 kb_id IN (用户读得到的库) 再过滤一遍，越权的那部分自然拿不到。
+      3. **软删的文档必须在这里断掉**。删文档时向量清理可能失败（网络/权限），
+         库里会留下脏向量；不 JOIN documents 滤 deleted_at 就会把已删文档答给用户。
+
+    kb_ids 为空直接返回空列表 —— 和 search_chunks 一样，默认值永远是"查不到"。
+    返回顺序不保证（交给上层按分数排），但每个入参 id 最多对应一行。
+    """
+    pks = [pk for pk in (_to_uuid(item) for item in (chunk_ids or [])) if pk is not None]
+    scope = [kb for kb in (_to_uuid(item) for item in (kb_ids or [])) if kb is not None]
+    if not pks or not scope:
+        return []
+
+    result = await db.execute(
+        select(
+            Chunk.id,
+            Chunk.kb_id,
+            Chunk.document_id,
+            Chunk.owner_id,
+            Chunk.seq,
+            Chunk.content,
+            Chunk.page,
+            Chunk.heading,
+            Chunk.token_count,
+            Document.title,
+            Document.filename,
+        )
+        .join(Document, Document.id == Chunk.document_id)
+        .where(
+            Chunk.id.in_(pks),
+            Chunk.kb_id.in_(scope),
+            Document.deleted_at.is_(None),
+        )
+    )
+    hits: list[dict] = []
+    for row in result.all():
+        hits.append(
+            {
+                "chunk_id": row[0],
+                "kb_id": row[1],
+                "document_id": row[2],
+                "owner_id": row[3],
+                "seq": int(row[4] or 0),
+                "content": row[5] or "",
+                "page": row[6],
+                "heading": row[7],
+                "token_count": int(row[8] or 0),
+                "document_title": row[9] or "",
+                "document_filename": row[10] or "",
+            }
+        )
+    return hits
+
+
 __all__ = [
     "count_document_chunks",
+    "list_chunks_by_ids",
     "search_chunks",
     "delete_document_chunks",
     "list_chunks_for_embedding",

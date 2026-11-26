@@ -34,6 +34,7 @@ from app.schemas.user_schemas import (
     UserResponse,
     UserUpdate,
 )
+from app.services import user_cache
 
 router = APIRouter(
     prefix="/user",
@@ -85,6 +86,8 @@ async def login_user(payload: UserLogin, request: Request, db: DB):
         user_agent=request.headers.get("user-agent"),
     )
     await user_crud.touch_last_login(user, db)
+    # last_login_at 变了 → 键必须失效，否则 /user/info 会显示上上次的登录时间
+    await user_cache.invalidate(user.id)
 
     data = TokenResponse(
         access_token=token,
@@ -97,7 +100,7 @@ async def login_user(payload: UserLogin, request: Request, db: DB):
 
 @router.get("/info", response_model=ApiResponse[UserResponse], summary="获取用户信息")
 async def get_user_info(current_user: CurrentUser):
-    """查询当前登录用户的信息
+    """查询当前登录用户的信息（只读车道：这条允许命中 Redis 缓存）
 
     用户身份完全由 get_current_user 从 Authorization 头解析出来，
     所以这里不需要（也不接受）user_id 参数 —— 传了也只会返回自己的信息，
@@ -114,6 +117,8 @@ async def logout_user(
 ):
     """退出登录：把当前 JWT 从 token 表删掉，之后再拿它请求就会 401"""
     await token_crud.revoke_token(token, db)
+    # 刻意**不**删用户缓存：缓存里没有 token 状态，吊销与否每次都在 tokens 表判。
+    # 这里要是也去删一把，就等于暗示"登出靠缓存生效"，那是错的因果。
     return ApiResponse.ok(msg="已退出登录")
 
 
@@ -130,21 +135,35 @@ async def update_user_info(payload: UserUpdate, current_user: CurrentUser, db: D
         if await user_crud.is_email_taken(payload.email, db, exclude_id=current_user.id):
             raise ConflictError("该邮箱已被占用")
 
-    user = await user_crud.update_user(current_user, payload, db)
+    # 写车道：current_user 有可能是缓存里的 transient 实例，直接改它等于改了个影子
+    # （属性变了、commit 什么都没写、接口还返回 200 —— 这类 bug 只能靠"改之前回源"根治）
+    user = await user_cache.load_for_write(current_user.id, db)
+    if user is None:
+        raise UnauthorizedError("账号不存在或已注销，请重新登录")
+
+    user = await user_crud.update_user(user, payload, db)
     if user is None:
         raise ConflictError("用户名或邮箱已被占用，请更换后重试")
 
+    # 旁路缓存的固定顺序：**先落库，再删键**（不是先更新缓存，也不是落库后写缓存）
+    await user_cache.invalidate(user.id)
     return ApiResponse.ok(UserResponse.model_validate(user), msg="修改成功")
 
 
 @router.post("/reset_password", response_model=ApiResponse[None], summary="修改密码")
 async def reset_password(payload: PasswordChange, current_user: CurrentUser, db: DB):
     """改密码：需要校验原密码，改完后所有端上的 token 全部失效，需重新登录"""
-    if not verify_password(payload.old_password, current_user.hashed_password):
+    user = await user_cache.load_for_write(current_user.id, db)
+    if user is None:
+        raise UnauthorizedError("账号不存在或已注销，请重新登录")
+
+    # hashed_password **不在缓存里**（密码哈希不进任何外部存储），所以验原密码必须回源
+    if not verify_password(payload.old_password, user.hashed_password):
         raise UnauthorizedError("原密码不正确")
 
-    await user_crud.set_password(current_user, get_password_hash(payload.new_password), db)
-    revoked = await token_crud.revoke_all_user_tokens(current_user.id, db)
+    await user_crud.set_password(user, get_password_hash(payload.new_password), db)
+    revoked = await token_crud.revoke_all_user_tokens(user.id, db)
+    await user_cache.invalidate(user.id)
 
     return ApiResponse.ok(msg=f"密码修改成功，请重新登录（已失效 token 数: {revoked}）")
 
@@ -152,11 +171,18 @@ async def reset_password(payload: PasswordChange, current_user: CurrentUser, db:
 @router.post("/delete", response_model=ApiResponse[None], summary="注销账号")
 async def delete_user(payload: AccountDelete, current_user: CurrentUser, db: DB):
     """注销账号：需要密码确认，关联的 token / documents 会被级联删除"""
-    if not verify_password(payload.password, current_user.hashed_password):
+    user = await user_cache.load_for_write(current_user.id, db)
+    if user is None:
+        raise UnauthorizedError("账号不存在或已注销，请重新登录")
+
+    if not verify_password(payload.password, user.hashed_password):
         raise UnauthorizedError("密码不正确，无法注销账号")
 
-    if not await user_crud.delete_user(current_user, db):
+    if not await user_crud.delete_user(user, db):
         raise ConflictError("账号注销失败，请稍后重试")
+
+    # 注销是硬删。键必须删掉：缓存不该依赖"token 级联删除反正会挡住"这种间接正确性
+    await user_cache.invalidate(user.id)
 
     return ApiResponse.ok(msg="账号已注销")
 

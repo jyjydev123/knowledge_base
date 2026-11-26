@@ -14,6 +14,15 @@ os.environ.setdefault("SQL_ECHO", "False")
 # 上传接口默认会丢一个后台解析任务，而测试里全局引擎是**没建表的内存库**：
 # 任务跑了只会制造 "no such table" 噪声。索引逻辑用 process_document(session=...) 直接测。
 os.environ.setdefault("DOCUMENT_INDEX_ON_UPLOAD", "False")
+# 长期记忆的业务默认已经是 pgvector（唯一生产车道），但测试连的是临时 SQLite：
+# 走 pgvector 只会在第一次读写时撞一次"连不上"然后降级成不记，断言全是空，
+# 那等于把 68 条记忆用例变成"什么也没测"。所以测试车道显式钉在离线 self-test 后端 local。
+# （store.py 里"pgvector 连不上不再自动退 local"这条规矩，正是为了让这种选择必须是显式的）
+os.environ.setdefault("MEMORY_BACKEND", "local")
+# 测试车道**永远不碰真 Redis**（本机可能装着 redis、也可能没装；CI 机器上更是随机）。
+# 缓存的行为用假客户端在 tests/test_cache_user.py 里显式测，
+# 而 /health 之类的用例必须保持确定性 —— 一个靠外部服务状态的测试比没写更糟。
+os.environ.setdefault("REDIS_ENABLED", "False")
 
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402

@@ -16,8 +16,9 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from app.api.v1.aichatrouter import router as aichat_router
 from app.api.v1.documentrouter import router as document_router
 from app.api.v1.kbrouter import router as kb_router
+from app.api.v1.searchrouter import router as search_router
 from app.api.v1.userrouter import router as user_router
-from app.core import startup
+from app.core import cache, startup
 from app.core.config import settings
 from app.core.exceptions import BusinessError
 from app.schemas.common import ApiResponse
@@ -33,6 +34,9 @@ async def lifespan(_: FastAPI):
     # 内存库/未配库会在 startup 里短路，所以测试车道（with TestClient）不会因此多连一次库
     await prepare_schema()
     yield
+    # 关掉 Redis 连接池。不关的话 uvicorn --reload 时每轮重启都留一批半开连接，
+    # 攒到 max_connections 就再也没法建缓存（症状是"跑了一会儿缓存突然全失效"）。
+    await cache.aclose()
 
 
 app = FastAPI(
@@ -113,6 +117,7 @@ app.include_router(user_router, prefix=settings.API_V1_PREFIX)
 app.include_router(document_router, prefix=settings.API_V1_PREFIX)
 app.include_router(kb_router, prefix=settings.API_V1_PREFIX)
 app.include_router(aichat_router, prefix=settings.API_V1_PREFIX)
+app.include_router(search_router, prefix=settings.API_V1_PREFIX)
 
 
 @app.get("/", response_model=ApiResponse[dict], summary="根路径", tags=["Meta"])

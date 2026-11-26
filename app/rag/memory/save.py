@@ -11,14 +11,24 @@
      换模型必须连 EMBEDDING_DIMS 和 collection 一起换，否则插入时报维度不一致。
   3. DeepSeek 没有 embedding 接口。对话模型和向量模型是两件事，各自配各家：
      LLM_API_KEY / LLM_BASE_URL 走对话，EMBEDDING_API_KEY / EMBEDDING_BASE_URL 走向量。
+     本项目 embedding 默认阿里云百炼的 OpenAI 兼容模式（text-embedding-v3 / 1024 维），
+     所以**只需要填一个 EMBEDDING_API_KEY**，端点和模型名都有可用默认值。
+  4. 百炼 v3/v4 单请求最多 10 条文本，而 langchain 的 OpenAIEmbeddings 默认
+     chunk_size=1000 —— 不显式传就等于每批都 400。见下面 build_embeddings 里的 chunk_size。
 """
 
 from __future__ import annotations
 
 from functools import lru_cache
 
-from app.core.config import settings
+from app.core.config import DASHSCOPE_EMBEDDING_DIMS, settings
 from app.rag.memory.base import MemoryNotConfiguredError
+
+
+def _supports_dimensions(model: str) -> bool:
+    """这个 embedding 模型吃不吃 dimensions 参数（百炼 v3/v4 + OpenAI v3 系列吃）"""
+    name = (model or "").strip().lower()
+    return name in DASHSCOPE_EMBEDDING_DIMS or name.startswith("text-embedding-3")
 
 
 def _to_psycopg_dsn(url: str) -> str:
@@ -36,24 +46,35 @@ def _to_psycopg_dsn(url: str) -> str:
 
 
 def build_embeddings():
-    """按配置造 embedding 客户端（没有 key 就明确报错，不要静默走 OpenAI 默认值）"""
+    """按配置造 embedding 客户端（没有 key 就明确报错，不要静默走 OpenAI 默认值）
+
+    传参的每一条都有理由，改之前先看注释：
+      api_key     —— 只从 settings 读，绝不落进代码或日志；
+      openai_api_base —— 默认已是百炼兼容端点，换厂商只改 EMBEDDING_BASE_URL；
+      dimensions  —— 百炼 v3/v4 与 OpenAI v3 系列支持，其余模型传了会 400；
+      chunk_size  —— 批量条数。百炼上限 10，用 settings.EMBEDDING_BATCH_SIZE 覆盖
+                     langchain 默认的 1000，否则 add_texts 一批就 400。
+    """
     from langchain_openai import OpenAIEmbeddings
 
     if not settings.embedding_ready:
         raise MemoryNotConfiguredError(
-            "长期记忆（pgvector 车道）需要 embedding 服务：请在 .env 里配 EMBEDDING_API_KEY"
-            "（DeepSeek 没有 embedding 接口，EMBEDDING_BASE_URL 要指向提供 embedding 的那一家）"
+            "pgvector 车道需要 embedding 服务：请在 .env 里配 EMBEDDING_API_KEY"
+            f"（模型默认 {settings.EMBEDDING_MODEL}，端点 {settings.EMBEDDING_BASE_URL}；"
+            "DeepSeek 没有 embedding 接口，LLM_API_KEY 不能拿来当这个用）"
         )
 
-    kwargs = {
+    kwargs: dict = {
         "model": settings.EMBEDDING_MODEL,
         "api_key": settings.EMBEDDING_API_KEY,
         "timeout": settings.LLM_TIMEOUT_SECONDS,
+        "chunk_size": max(1, settings.EMBEDDING_BATCH_SIZE),
     }
     if settings.EMBEDDING_BASE_URL:
         kwargs["openai_api_base"] = settings.EMBEDDING_BASE_URL
-    # dimensions 只有 v3 系列支持；给老模型传这个参数会 400
-    if settings.EMBEDDING_MODEL.startswith("text-embedding-3") and settings.EMBEDDING_DIMS:
+    # dimensions 只有 v3 系列（OpenAI text-embedding-3-* 与百炼 text-embedding-v3/v4）支持；
+    # 给老模型传这个参数会 400，所以按模型名白名单判断，不盲传。
+    if settings.EMBEDDING_DIMS and _supports_dimensions(settings.EMBEDDING_MODEL):
         kwargs["dimensions"] = settings.EMBEDDING_DIMS
     return OpenAIEmbeddings(**kwargs)
 

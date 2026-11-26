@@ -9,9 +9,12 @@
     4. 建表用 scripts/init_db.py（由本文件生成），init_db.sql 只是它的一份可读快照；
     5. 状态字段用 varchar + 本文件里的 StrEnum 常量，不建数据库枚举类型
        （PG 的 CREATE TYPE 改值很痛，varchar + CHECK/常量更灵活）；
-    6. 会话与消息已落库（chat_sessions / chat_messages）。还没做的：
-       - chunks.embedding 向量列 + pgvector → TODO.md §1/§7，embedding 模型与维度定了再加
+    6. 会话与消息已落库（chat_sessions / chat_messages）。表结构目前**只欠两列**（TODO.md §7）：
        - chat_sessions.agent（会话选哪个 agent）→ TODO.md §5，M8 一并加
+       - password_reset_tokens 表 → TODO.md §6，配合"忘记密码"一起做
+       chunks.embedding 已经**决定不加**：文档向量存在 PGVector 自己的 langchain_pg_* 两张表里，
+       靠 metadata 的 chunk_id 对应回 chunks 行（模型已定：百炼 text-embedding-v3 / 1024 维）。
+       好处是换 embedding 只重建 collection、不动表结构；代价是检索必须回表（已实现）。
 """
 
 import uuid
@@ -74,8 +77,17 @@ PERMISSION_LEVEL = {KbPermission.READ: 1, KbPermission.WRITE: 2}
 
 
 class DocStatus(StrEnum):
-    """documents.status 流转: pending -> parsing -> chunking -> indexed / failed"""
+    """documents.status 流转: pending -> parsing -> chunking -> indexed / failed
 
+    stored 是**旁路**，不在这条流转里：图片这类"文件已落盘但不走文本解析"的资源。
+    为什么单开一个值而不是复用 pending：
+      1. pending 会被重索引/启动捡漏逻辑当成"待处理"再跑一遍解析，图片解析必失败，
+         白白把 status 变成 failed 并写一条误导性的 error_msg；
+      2. /documents/status 的计数要能区分"卡在解析里"和"本来就不解析"，
+         混在 pending 里这两个永远分不开。
+    """
+
+    STORED = "stored"    # 已落盘、不参与文本解析（图片/多媒体，等 OCR 或多模态车道接管）
     PENDING = "pending"
     PARSING = "parsing"
     CHUNKING = "chunking"

@@ -143,7 +143,9 @@ class ChatAnswerOut(BaseModel):
     session_id: uuid.UUID = Field(description="会话ID")
     answer: str = Field(description="模型回答全文")
     sources: list[dict] = Field(default_factory=list, description="引用来源（可能为空数组）")
-    retrieval_mode: str = Field(description="检索车道: keyword / disabled / no_scope / none")
+    retrieval_mode: str = Field(
+        description="实际生效的检索车道: keyword / vector / hybrid / none / no_scope / no_terms / disabled",
+    )
     stopped: bool = Field(default=False, description="是否被 /stop 中断（非流式车道恒为 false）")
     turn: dict = Field(default_factory=dict, description="本轮落库结果：消息数、窗口 token 等")
 
