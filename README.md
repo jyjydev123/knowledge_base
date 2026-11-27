@@ -2,8 +2,19 @@
 
 一个 AI 本地知识库。
 
-- **[TODO.md](TODO.md)** —— 还差什么没实现（**真 PG / 向量库的真机验收**、后端 6 条尾巴、前端、手机化、上线前收尾），做功能先看这里
+**根目录**
+
+- **[TODO.md](TODO.md)** —— 还差什么没实现（§1 就是一张**能照着打的真机验收清单**），做功能先看这里
 - **[DEVELOPMENT.md](DEVELOPMENT.md)** —— 开发规范（分层、统一返回格式、命名、鉴权、测试、Git、依赖）
+
+**docs/ —— 专项说明**
+
+| 文件 | 管什么 | 什么时候看 |
+| --- | --- | --- |
+| [docs/TESTING.md](docs/TESTING.md) | 测试体系：怎么跑、`conftest` 的六条环境钉子、写用例的六条规矩、ruff 基线 | 加/改用例，或者"我这测试为什么红了" |
+| [docs/TESTPLAN.md](docs/TESTPLAN.md) | 真机验收计划：`TC-*` 用例表（数据库/文档/磁盘/视觉/检索/对话/权限/记忆/缓存/手机） | 现在开始照着打勾 |
+| [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) | 部署：依赖矩阵、从零装、`.env` 全表、systemd/Compose/手机壳、反代 SSE、上线检查表、升级回滚 | 要把它放到服务器或手机上 |
+| [docs/OPERATIONS.md](docs/OPERATIONS.md) | 运维排障：命令速查、`/health` 怎么读、备份恢复演练、容量估算、**18 条故障对照表** | 跑起来之后出问题 |
 
 ## 目录结构
 
@@ -14,19 +25,24 @@
 ├── .venv/                      # 虚拟环境（根目录，已 gitignore）
 ├── requirements*.txt           # 给 pip 用户的等价清单
 ├── init_db.sql                 # 由 models.py 生成的 PG 建表快照（勿手改）
-├── start.sh                    # 启动脚本（uvicorn app.main:app --reload）
+├── start.sh                    # 启动脚本：api（默认）/ web / all / check，见「快速开始」
+├── scripts/preflight.py        # 体检实现：数据库/LLM/Embedding/向量/记忆/Redis/上传限制（只读配置不联网）
 ├── scripts/
 │   ├── init_db.py              # 建表 / --drop 重置 / --check / --snapshot 生成 SQL
 │   ├── parse_document.py       # 解析预览 CLI：看一个文件被切成哪些块（M2 排错用）
 │   ├── index_documents.py      # 文档向量化入库 CLI（按 document_id 幂等；--query 走线上同一条检索）
+│   ├── prune_data.py           # 磁盘↔数据库对账（默认 dry-run；只删文件、连不上库就退出）
+│   ├── preflight.py            # ./start.sh check 的实现（只读配置，不连任何服务）
 │   └── try_memory.py           # 记忆层自检 CLI（不建库不联网也能跑）
+├── docs/                       # 测试说明 / 真机验收计划 / 部署 / 运维排障（见上面的文档索引）
 ├── tests/                      # 接口测试 + 表结构测试
 ├── frontend/                   # Vue 3 + Vite + TS + Naive UI（第一版已实现，见下面「前端」一节）
 │   ├── src/api/                # 唯一出网口：client(信封解包/401) · endpoints(33 条) · sse(流式) · types
 │   ├── src/views/              # 6 个页面：登录 · 知识库 · 文档 · 授权 · 对话 · 搜索 ·（我的）
 │   ├── src/stores|router|utils # Pinia 登录态 · 路由守卫与 hash 回退 · token 存取(壳里换 Preferences)
 │   └── src/components/         # MarkdownBlock(过 DOMPurify) · SourceList · StatusTag · KbFormModal
-├── data/                      # 知识库数据（文件、图片、视频、音频、文档、模型等）
+├── data/                      # **只有用户上传的原件**：data/{user_id}/{kb_id}/ + data/share/{kb_id}/
+├── var/                       # 可重建的派生物（local 记忆车道的 jsonl 等），别和 data/ 混
 └── app/                        # 后端代码包
     ├── main.py                 # FastAPI 入口 + 统一返回格式的异常处理器
     ├── api/
@@ -86,16 +102,39 @@ cp .env.example .env
 .venv/bin/python scripts/init_db.py --drop     # 开发期重置：删表重建（会清空数据）
 #    init_db.sql 是同一份结构生成的 PostgreSQL 快照，可用 --snapshot > init_db.sql 刷新
 
-# 4. 启动
-./start.sh            # 等价于 uvicorn app.main:app --reload
+# 4. 启动前体检（只读配置，不连库、不联网，30 秒看清哪些功能会自动降级）
+./start.sh check
+
+# 5. 启动
+./start.sh            # = uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
 ```
+
+`start.sh` 支持的开关（都是这轮前端/手机化用得到的）：
+
+| 用法 | 作用 |
+| --- | --- |
+| `./start.sh check` | 只做配置体检，不起服务。没配 key 时向量入库/语义检索/长期记忆都会**自动降级**，界面看不出来，这里一测就知道 |
+| `./start.sh all` | 一条命令起完：**后端另开一个终端窗口**（自动挑 konsole/gnome-terminal/xterm…），当前窗口留给前端。后端探到端口真在监听才拉 vite；`8000` 已被占用就直接复用现有后端 |
+| `NOTERM=1 ./start.sh all` | 不开新窗口，两边日志合流到当前终端，靠 `[api]` / `[web]` 前缀区分（后端完整日志在 `logs/api.log`）。没有图形会话时用这个 |
+| `TERMINAL=xterm ./start.sh all` | 指定用哪个终端模拟器 |
+| `./start.sh web` | 只起前端 dev server（5173，`node_modules` 不在会自动 `npm install`）；后端仍需自己跑（或用 `all`），否则页面全是报错 |
+| `WEB_PORT=5174 ./start.sh web` | 改前端端口（`HOST`/`PORT` 管后端，`WEB_HOST`/`WEB_PORT` 管前端） |
+| `NO_RELOAD=1 ./start.sh` | 关热重载。手机联调时你改一行代码就断一次 SSE，很干扰判断 |
+| `HOST=127.0.0.1 PORT=9000 ./start.sh` | 改监听地址（默认 `0.0.0.0:8000`，是为了让手机能直连局域网 IP） |
+| `./start.sh --log-level debug` | 其余参数原样透给 uvicorn |
+| 缺 `.venv` / 缺 `.env` | 直接给"下一步该跑哪条命令"的提示，而不是一句 `No such file or directory` |
 
 接口文档：<http://127.0.0.1:8000/docs>
 
 前端（可选，第 5 步）：
 
 ```bash
-cd frontend && npm install && npm run dev     # http://<局域网IP>:5173，dev 走 vite 代理到 127.0.0.1:8000
+./start.sh all        # 推荐：后端开在新终端窗口 + 当前终端跑前端
+# 或者分开跑，方便只看某一边的日志：
+./start.sh api        # 只后端 8000（不带模式名也是它）
+./start.sh web        # 只前端 5173（等价于 cd frontend && npm run dev）
+NOTERM=1 ./start.sh all  # 前后端都留在当前终端，[api]/[web] 前缀
+# http://<局域网IP>:5173，dev 走 vite 代理到 127.0.0.1:8000
 ```
 
 ## 前端（M7：第一版已实现）
@@ -218,7 +257,8 @@ curl -s localhost:8000/health | head -c 200      # 探库带超时（HEALTH_CHEC
 | 改库设置、删库、增删授权 | ✓ | ✗ | ✗ | ✗ |
 
 两条对外语义：连 `read` 都没有 → 一律 **404**（不暴露别人的库是否存在）；能读不能写 → **403**。
-共享库里别人上传的文件落在**库主人**目录下：`data/{库owner}/{kb_id}/{document_id}.{ext}`，一个库一个目录。
+共享库里**被授权人**上传的文件落在 `data/share/{kb_id}/{document_id}.{ext}`，**不写进库主人的个人目录**
+（否则 B 的磁盘算到 A 头上、删 A 账号时还会留下孤儿）。一个库最多两个目录，路径由 (库owner, 上传者) 唯一决定，事后能复算。
 
 ### 文档 `/documents`
 
@@ -226,8 +266,8 @@ curl -s localhost:8000/health | head -c 200      # 探库带超时（HEALTH_CHEC
 | --- | --- | --- | --- |
 | GET | `/list` | 分页列出自己的文档（可按 `kb_id` 过滤），带 `download_url` | ✅ 已实现 |
 | POST | `/upload` | 上传文档：后缀白名单 → 体积上限（读的过程中卡，不信 Content-Length）→ 魔数核对后缀 → sha256 判重 → 落盘 → 写库（失败回滚） | ✅ 已实现 |
-| POST | `/image/upload` | **上传图片**（jpg/png/webp/gif/bmp，`IMAGE_MAX_SIZE_MB` 上限）：落盘 + 写库，`status=stored` 不参与文本解析 | ✅ 已实现 |
-| POST | `/reindex/{document_id}` | 重新解析入库单篇（`failed` 的重跑入口）：立刻返回，结果轮询 `/status` | ✅ 已实现 |
+| POST | `/image/upload` | **上传图片**（jpg/png/webp/gif/bmp，`IMAGE_MAX_SIZE_MB` 上限）：落盘 + 写库；视觉车道就绪时 `status=pending` 生成图片描述并进索引，没配 key 时退回 `status=stored` 只存档 | ✅ 已实现 |
+| POST | `/reindex/{document_id}` | 重新解析入库单篇：`failed` 的重跑入口，**先传图后配 key 的 `stored` 也能被接管补描述**；立刻返回，结果轮询 `/status` | ✅ 已实现 |
 | GET | `/detail` | 文档详情：正文预览（按 chunk seq 升序）+ `kb_name`/`kb_version`/`chunk_total` | ✅ 已实现 |
 | GET | `/status` | 知识库状态：六种解析进度 + **磁盘↔数据库一致性核对**（`missing_files`/`orphan_files`/`healthy`） | ✅ 已实现 |
 | DELETE | `/delete/{document_id}` | 先判边界 → 删记录（级联删块、知识库 version+1）→ 再删磁盘文件 | ✅ 已实现 |
@@ -244,9 +284,34 @@ curl -s localhost:8000/health | head -c 200      # 探库带超时（HEALTH_CHEC
 | 魔数嗅探 | 后缀写 pdf 但内容不是 `%PDF`、后缀 png 内容不是 PNG 头… | 400 |
 | 空文件 | 0 字节（`UPLOAD_REJECT_EMPTY`，默认拒）：进库只会变成一条永远失败的记录 | 400 |
 
-图片走的是 `status=stored` 这条旁路：文件存得下、能下载、能删，但**不解析、不切块、不进向量库**。
-为什么不用 `pending`：`pending` 会被重索引逻辑捞出来跑解析，图片解析必失败，
-用户会看到一条莫名其妙的 `failed`。OCR / 多模态问答接上之后再把它推进解析流。
+### 图片怎么变成「能搜到的内容」（A 路线）
+
+图片**不另开一条多模态检索链路**，而是先转成文字，再走和 pdf/md 完全一样的切块 → `chunks` → pgvector：
+
+```
+POST /documents/image/upload → 落盘 data/…/{doc_id}.png → 后台 process_document
+  → parsers/image.py → services/vision.py（qwen-vl 兼容模式）→ 描述文本
+  → chunker → chunks 表 → index_documents 向量化 → POST /search 能命中
+```
+
+为什么不直接「原图喂给模型」：那要同时满足三件事 —— LLM 支持图片输入（`deepseek-chat` 没有视觉输入）、
+消息里带 base64/URL、手机侧扛得住体积。换成「描述入库」只需要一次模型调用，
+检索层、引用出处、权限范围（`--kb`）一行都不用改。
+
+三条降级规矩（`GET /health` 的 `vision` 一节 + `./start.sh check` 都能看到原因）：
+
+| 情况 | 结果 |
+| --- | --- |
+| 没配 `VISION_API_KEY`（也没配百炼 `EMBEDDING_API_KEY`） | 维持 `status=stored`：只存不解析，**不会**留下一条 `failed` |
+| 有 key 但 `IMAGE_PARSE_ENABLED=False` | 同上（显式关车道）；库里图片数量看 `/documents/status` 的 `stored` 计数 |
+| 车道开着但调用失败（额度/网络/模型名错） | `status=failed` + 写清原因；**绝不**写一条空的 `indexed`（那是「库里有张永远搜不到的图」，比 failed 难查） |
+
+key 默认复用百炼那把（`text-embedding-v3` 和 `qwen-vl-max` 同一个兼容模式网关）。
+送模型前等比缩到 `VISION_MAX_PIXELS`、EXIF 转正（要 Pillow，没装就只卡字节上限并明确报错）；
+png/webp 保无损（票据小字经不起二次有损压缩），jpg 重编码成 jpeg。
+
+**扫描件 PDF** 是同一套逻辑的另一面（整页提不到字 → 栅格化 → 逐页描述），默认关：
+一页一次付费请求，50 页的扫描件就是 50 次。要开就 `.env` 里 `SCANNED_PDF_VISION=True` 并 `uv add pymupdf`。
 
 上传之后**解析/切块是异步的**：接口立刻返回 `status=pending`，后台任务把状态推到
 `indexed` 或 `failed`（失败原因在 `error_msg`），前端轮询 `GET /documents/status` 就行。
@@ -288,7 +353,8 @@ curl -s localhost:8000/health | head -c 200      # 探库带超时（HEALTH_CHEC
 `/documents/status` 的核对口径：`missing_files` 按每条记录的 `file_path` 逐个 `isfile` 判（精确，与目录布局无关）；
 `orphan_files` 扫该库的两个目录（库主人目录 + `data/share/{kb_id}/`）取差集。两者都空才算 `healthy=true`；
 不一致也返回 **200** —— 接口本身执行成功了，数据完整性用字段表达，不混 HTTP 语义。
-⚠️ 约定目录之外的历史文件（如已废弃的 `data/kb/...`）扫不到，需要一次性清理脚本，不属于接口职责。
+约定目录之外的历史文件（如已废弃的 `data/kb/...`）接口扫不到，交给 **`scripts/prune_data.py`** 对账：
+以 `documents.file_path` 为准，默认只报告，`--apply` 才删孤儿文件并自底向上收空目录；连不上库就直接退出，不猜。
 
 ### 搜索 `/search`
 
@@ -479,6 +545,6 @@ chat_messages      消息：session_id(级联删) + user_id(冗余，鉴权只�
 `chunk_size=10`、`dimensions=1024` 这些会真花钱/真报 400 的参数），向量库换成假 store，
 但**回表走真 SQLite** —— 软删文档能不能挡住、跨库能不能拿到，只有真表测得出来。
 
-对话接口的测试**不出网**：模型只从 `answer.get_answer_model()` 取，测试把它换成假模型，于是 SSE 分帧、消息转换、检索、落库都是真链路；长期记忆换成 `NullBackend`，避免测试往 `data/memory/` 写文件。
+对话接口的测试**不出网**：模型只从 `answer.get_answer_model()` 取，测试把它换成假模型，于是 SSE 分帧、消息转换、检索、落库都是真链路；长期记忆换成 `NullBackend`，避免测试往 `var/memory/` 写文件。
 
 > 仍然**没有真 PG 跑通过的证据**：全部用例都是临时 SQLite，`chat_messages` 的级联删除靠 `PRAGMA foreign_keys=ON` 模拟。建库那步别省（`TODO.md` §1）。

@@ -16,7 +16,8 @@
 | 数据库 | PostgreSQL + pgvector；驱动 `asyncpg`（异步必需 `greenlet`） |
 | 缓存 | Redis（`redis` 包，旁路 cache-aside，**可选依赖**：没装/连不上都自动回源数据库） |
 | 测试 | pytest + `fastapi.testclient.TestClient` + 临时文件 SQLite（不依赖本机 PG） |
-| 启动 | 项目根执行 `./start.sh`（= `uvicorn app.main:app --reload`） |
+| 启动 | 项目根 `./start.sh`（= `uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload`）；`./start.sh web` 只起前端 vite、`./start.sh all` 把后端丢进新终端窗口+当前终端跑前端（没图形会话就 `NOTERM=1 ./start.sh all`，日志合流带 `[api]`/`[web]` 前缀）；起前先 `./start.sh check` 做配置体检（实现 `scripts/preflight.py`，只读配置不联网，真连通性看 `GET /health`） |
+| 专项文档 | 测试规范与跑法 → `docs/TESTING.md`；真机验收用例表 → `docs/TESTPLAN.md`；部署与配置全表 → `docs/DEPLOYMENT.md`；排障与备份 → `docs/OPERATIONS.md`。本文件只管**怎么写代码** |
 | 建表 | **`scripts/init_db.py`**（`--drop` / `--check` / `--snapshot`），表结构真源是 `app/db/models.py` |
 
 ## 2. 分层与依赖方向（只能上层调下层）
@@ -195,7 +196,8 @@ data: {"status":200,"msg":"chunk","data":{"text":"你好"}}
 - **状态用常量**：`UserRole / KbVisibility / DocStatus`（`app/db/models.py` 里的 `StrEnum`），
   列类型是 varchar，不要在 PG 上 `CREATE TYPE ... AS ENUM`（改值太痛）；状态流转 `pending → parsing → chunking → indexed / failed`。
 - **统计与版本**：文档增删后必须调 `document_crud.refresh_kb_stats(kb_id, db)`（重算 document_count/chunk_count、`version+1`、`last_indexed_at`），别让知识库的版本号和真实内容脱节。
-- **存储路径约定（已定）**：`data/{user_id}/{kb_id}/{document_id}.{ext}`（相对进程 CWD），
+- **存储路径约定（已定）**：`data/{user_id}/{kb_id}/{document_id}.{ext}`（相对进程 CWD，根目录是配置项
+  `settings.DATA_DIR`，**不许在代码里再写死 "data"**；派生物走 `settings.VAR_DIR`），
   库里 `documents.file_path` 存的也是这一串；唯一来源是
   `services.process_document.document_storage_path()`，落盘/删除/列目录/边界校验都调它，
   **不要在别处手拼字符串**（拼错了删除接口会拒绝删文件，只留孤儿文件）。
@@ -323,7 +325,7 @@ data: {"status":200,"msg":"chunk","data":{"text":"你好"}}
   ```
   类型：`feat` / `fix` / `refactor` / `docs` / `test` / `chore`；标题 ≤50 字、一句话说清做了什么，正文列要点。
 - **一次 commit 只做一件事**，且必须让 `pytest` 全绿（不要提交已知红灯）。
-- 禁止提交：`.env`、`data/`、真实业务文档、`.venv/`、`frontend/node_modules/`、模型权重、`__pycache__`。
+- 禁止提交：`.env`、`data/`、`var/`、真实业务文档、`.venv/`、`frontend/node_modules/`、模型权重、`__pycache__`。
 - push 前自检：`git status` 干净 → `pytest` 绿 → `/docs` 看一眼返回格式 → 更新 `TODO.md` 勾选框。
 - 本项目 SSH 走 `ssh.github.com:443`（`~/.ssh/config`），remote 用 `git@github.com:<owner>/<repo>.git`。
 
@@ -345,7 +347,7 @@ data: {"status":200,"msg":"chunk","data":{"text":"你好"}}
 | `kbrouter.py`、`documentrouter.py`、`searchrouter.py` | **M0 已补**：33 条端点全部实现（知识库 5 + 授权 3 + 文档 8 + 对话 8 + 用户 8 + 搜索 1） | 建库/删库从此有 HTTP 途径，前端不再需要脚本建库 |
 | `kbrouter.py` 路由顺序 | `DELETE /kb/{kb_id}` 必须排在 `DELETE /kb/share` **之后**（FastAPI 按注册顺序匹配，`share` 会被当 uuid → 422） | 有防回归测试钉住；新增 `/kb/xxx` 静态 DELETE 都要写在它前面 |
 | 上传体积上限 | 已是配置项 `UPLOAD_MAX_SIZE_MB` / `IMAGE_MAX_SIZE_MB`（原 20MB 路由常量去掉） | 模块级 `MAX_UPLOAD_BYTES` 保留为生效值（测试靠 monkeypatch 它触发 413）；改 .env 后需重启进程才生效 |
-| 图片车道 | `POST /documents/image/upload` 存得下/取得回/能删，`status=stored` **不参与解析** | OCR 或多模态接上之后再推进解析流（TODO §8） |
+| 图片车道 | `POST /documents/image/upload` 存得下/取得回/能删；视觉车道就绪时 `pending → indexed`（图片 → 描述 → **与 pdf 同一条切块链路**：`services/vision.py` + `parsers/image.py`），没配 key 时维持 `stored` 只存档 | 原图直接问答（B 路线）仍要等多模态 LLM（TODO §7.5） |
 | `MEMORY_BACKEND` | 默认已是 `pgvector`，且 pgvector 连不上**不再自动退 local**（明确不记 + `/health` 给原因）；测试车道靠 conftest 显式钉 `local` | 短期窗口的真源在 `chat_sessions/chat_messages`，但**进程重启后的窗口重建还没做**（TODO §3） |
 | Redis 旁路缓存 | 只缓存 users 单行身份；`/health` 的 `cache` 一节如实报 `client_ready`/`last_ok`/`circuit_open`（懒连接，构造成功≠能用）；失败拉闸 10 秒，半开自动重试 | 多 worker 天然共享；`/stop` 那种进程内状态仍是 TODO §3；限流/登录锁定也复用这套（别再引 slowapi） |
 | `app/services/process_document.py` | 路径唯一来源 `document_storage_path()`；落盘/删除/列目录都带 `kb_id`，同步 IO 一律由路由 `run_in_threadpool` 调 | M2 的解析/切块也放这里，别在路由里写文件操作 |
