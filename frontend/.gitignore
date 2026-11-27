@@ -37,3 +37,7 @@ __screenshots__/
 
 # Vite
 *.timestamp-*-*.mjs
+
+# 由 scripts/export_openapi.py 生成的 schema dump（0.4 秒可重导，不进版本库避免每次改接口都多一个 136K 的 diff）
+src/api/openapi.json
+src/api/schema.d.ts

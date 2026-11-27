@@ -1,0 +1,133 @@
+/* 全局只做三件事：重置、安全区、以及让 Markdown 渲染出来的东西像个文档。
+   组件级的样式留在各自 .vue 的 scoped 里。 */
+
+:root {
+  --kb-page-bg: #f5f6f8;
+  --kb-card-bg: #ffffff;
+  --kb-border: #e5e7eb;
+  --kb-text: #1f2329;
+  --kb-muted: #6b7280;
+  --kb-radius: 10px;
+  --kb-tab-height: 54px;
+  --kb-header-height: 52px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#app {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  background: var(--kb-page-bg);
+  color: var(--kb-text);
+  /* 中文字体顺序：先系统中文，再兜底，避免在安卓 WebView 里掉成宋体 */
+  font-family: -apple-system, BlinkMacSystemFont, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei',
+    'Noto Sans CJK SC', 'Segoe UI', Roboto, sans-serif;
+  font-size: 15px;
+  -webkit-text-size-adjust: 100%;
+}
+
+/* 手机壳里刘海和底部横条会让内容被压住，这两个 env() 是必须留的 */
+.kb-page {
+  min-height: 100%;
+  padding: 12px 12px calc(16px + env(safe-area-inset-bottom));
+}
+
+.kb-page--with-tabs {
+  padding-bottom: calc(var(--kb-tab-height) + env(safe-area-inset-bottom) + 16px);
+}
+
+.kb-card {
+  background: var(--kb-card-bg);
+  border: 1px solid var(--kb-border);
+  border-radius: var(--kb-radius);
+  padding: 12px;
+}
+
+.kb-muted {
+  color: var(--kb-muted);
+  font-size: 13px;
+}
+
+.kb-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.kb-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.kb-scroll-x {
+  overflow-x: auto;
+  white-space: nowrap;
+  -webkit-overflow-scrolling: touch;
+}
+
+/* 模型输出用 v-html 渲染，**必须**经过 MarkdownBlock 里的 DOMPurify；
+   这里的样式只负责排版，不覆盖 sanitize 的结果 */
+.kb-markdown {
+  line-height: 1.7;
+  word-break: break-word;
+}
+
+.kb-markdown h1,
+.kb-markdown h2,
+.kb-markdown h3 {
+  margin: 14px 0 8px;
+  font-size: 16px;
+}
+
+.kb-markdown p {
+  margin: 8px 0;
+}
+
+.kb-markdown ul,
+.kb-markdown ol {
+  margin: 8px 0 8px 20px;
+  padding: 0;
+}
+
+.kb-markdown code {
+  background: #f2f3f5;
+  border-radius: 4px;
+  padding: 1px 5px;
+  font-size: 13px;
+}
+
+.kb-markdown pre {
+  background: #f2f3f5;
+  border-radius: 8px;
+  padding: 10px;
+  overflow-x: auto;
+}
+
+.kb-markdown table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 13px;
+}
+
+.kb-markdown th,
+.kb-markdown td {
+  border: 1px solid var(--kb-border);
+  padding: 6px 8px;
+  text-align: left;
+}
+
+.kb-markdown blockquote {
+  margin: 8px 0;
+  padding: 4px 10px;
+  border-left: 3px solid var(--kb-border);
+  color: var(--kb-muted);
+}
