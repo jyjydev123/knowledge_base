@@ -1,8 +1,11 @@
 """文档落盘 / 路径约定 / 删除 / 解析入库编排
 
-路径约定是本项目的硬规矩，唯一来源是 document_storage_path()：
+路径约定是本项目的硬规矩，唯一来源是 document_storage_path()（根目录 = settings.DATA_DIR）：
     库主人上传      → data/{kb.owner_id}/{kb_id}/{document_id}.{ext}
     被授权人上传    → data/share/{kb_id}/{document_id}.{ext}
+
+data/ 里**只有这两类原件**：切块、向量、长期记忆都不落在磁盘上（切块在 PG 的 chunks 表，
+向量在 pgvector，local 记忆车道的 jsonl 在 var/memory/）。所以"切块的中间产物"没有目录要腾。
 落盘、删除、列目录、边界校验、解析入库都必须复算同一条规则，复算不一致就只删记录不碰磁盘。
 
 process_document() 是 M2 的编排入口：解析 → 切块 → 写 chunks → 推进 status。
@@ -15,20 +18,40 @@ import logging
 import os
 import re
 import shutil
+import time
 import uuid as uuid_lib
 from pathlib import Path as FsPath
 
 from fastapi import UploadFile
 
+from app.core.config import settings
+
 logger = logging.getLogger("app.services.document")
 
-DATA_ROOT = "data"
-SHARE_ROOT = "data/share"  # 别人共享给我的库里，我上传的文件放这里
+# 路径规则的根来自配置（settings.DATA_DIR），不是模块常量：测试要把整棵树指到临时目录，
+# 常量在 import 那一刻就定死了，monkeypatch 也来不及。
+SHARE_SUBDIR = "share"
+
+
+def data_root() -> str:
+    """知识库原件的根目录，默认 data/。去掉首尾斜杠，免得拼出 // 这种脏路径"""
+    # 只削尾部斜杠：绝对路径开头的 / 必须留着，否则 DATA_DIR=/tmp/xxx 会被削成相对的
+    # tmp/xxx，文件悄悄落到项目根 ./tmp/ 底下（测试隔离时最容易被这行坑）
+    root = str(getattr(settings, "DATA_DIR", "data") or "data").strip().rstrip("/")
+    return root or "data"
+
+
+def share_root() -> str:
+    """被授权人上传的文件根目录：data/share/"""
+    return f"{data_root()}/{SHARE_SUBDIR}"
 
 # 拼路径前必须先过这两条：uuid 段 + 纯字母数字扩展名
 # （就算 user_id/kb_id 来自数据库或 token，也不能赌它一定干净 —— 这是唯一一道防目录穿越的闸）
 SAFE_UUID_SEGMENT = re.compile(r"^[0-9a-fA-F]{1}(?:-?[0-9a-fA-F]){7,63}$")
 SAFE_EXT = re.compile(r"^[A-Za-z0-9]{1,10}$")
+
+# 单段耗时超过这个秒数就在日志里点名（几十页 PDF 解析几秒是正常的，别误报成故障）
+SLOW_STAGE_SECONDS = 3.0
 
 
 def _segment(value, name: str) -> str:
@@ -53,12 +76,12 @@ def _extension(ext: str) -> str:
 
 def kb_own_dir(user_id, kb_id) -> str:
     """库主人自己上传的文件目录：data/{user_id}/{kb_id}"""
-    return f"{DATA_ROOT}/{_segment(user_id, 'user_id')}/{_segment(kb_id, 'kb_id')}"
+    return f"{data_root()}/{_segment(user_id, 'user_id')}/{_segment(kb_id, 'kb_id')}"
 
 
 def kb_share_dir(kb_id) -> str:
     """被授权人上传的文件目录：data/share/{kb_id}"""
-    return f"{SHARE_ROOT}/{_segment(kb_id, 'kb_id')}"
+    return f"{share_root()}/{_segment(kb_id, 'kb_id')}"
 
 
 def document_storage_path(kb_owner_id, uploader_id, kb_id, document_id, ext: str) -> str:
@@ -174,9 +197,9 @@ def _safe_document_path(file_path: str) -> str:
     if not raw:
         raise DocumentProcessError("文档没有存储路径")
     resolved = FsPath(raw).resolve()
-    root = FsPath(DATA_ROOT).resolve()
+    root = FsPath(data_root()).resolve()
     if root not in resolved.parents and resolved != root:
-        raise DocumentProcessError(f"文档路径越出 data/ 目录，拒绝读取: {raw}")
+        raise DocumentProcessError(f"文档路径越出 {data_root()}/ 目录，拒绝读取: {raw}")
     if not resolved.is_file():
         raise DocumentProcessError(f"文件不存在: {raw}")
     return str(resolved)
@@ -218,6 +241,7 @@ async def process_document(document_id, *, session=None, force: bool = True) -> 
             await document_crud.update_status(document, DocStatus.FAILED, db, error_msg=str(exc)[:500])
             return {"ok": False, "status": DocStatus.FAILED, "chunks": 0, "tokens": 0, "reason": str(exc)}
 
+        t_start = time.perf_counter()
         try:
             parsed = await asyncio.to_thread(registry.parse_file, path)
         except DocumentParseError as exc:
@@ -235,18 +259,36 @@ async def process_document(document_id, *, session=None, force: bool = True) -> 
             await document_crud.update_status(document, DocStatus.FAILED, db, error_msg=message)
             return {"ok": False, "status": DocStatus.FAILED, "chunks": 0, "tokens": 0, "reason": message}
 
+        t_parse = time.perf_counter() - t_start
+        t_chunked = time.perf_counter()
         kb = await kb_crud.get_kb(document.kb_id, db)
-        pieces = chunk_parsed_document(
+        # 切块丢线程池：它是纯 CPU 的字符串活，占着事件循环的话整条链路的请求都跟着卡
+        # （pypdf 那步更明显 —— 纯 Python 抽文字，GIL 一直在它手里）
+        pieces = await asyncio.to_thread(
+            chunk_parsed_document,
             parsed,
             chunk_size=getattr(kb, "chunk_size", None),
             chunk_overlap=getattr(kb, "chunk_overlap", None),
         )
+        t_chunk = time.perf_counter() - t_chunked
 
         await document_crud.update_status(document, DocStatus.CHUNKING, db)
+        t_wrote = time.perf_counter()
         chunk_count, token_count = await chunk_crud.replace_document_chunks(document, pieces, db)
         await document_crud.set_chunk_stats(document, chunk_count, token_count, db)
         await document_crud.update_status(document, DocStatus.INDEXED, db, error_msg=None)
-        logger.info("文档入库完成 document_id=%s chunks=%d tokens=%d", document_id, chunk_count, token_count)
+        t_db = time.perf_counter() - t_wrote
+        logger.info(
+            "文档入库完成 document_id=%s chunks=%d tokens=%d 耗时 解析=%.2fs 切块=%.2fs 写库=%.2fs 合计=%.2fs",
+            document_id, chunk_count, token_count, t_parse, t_chunk, t_db, time.perf_counter() - t_start,
+        )
+        # 慢在哪一段直接说结论，省得下次再去猜（注意：embedding 不在这条链路里，见 index_documents.py）
+        slowest = max((("解析", t_parse), ("切块", t_chunk), ("写库", t_db)), key=lambda item: item[1])
+        if slowest[1] > SLOW_STAGE_SECONDS:
+            logger.warning(
+                "索引偏慢 document_id=%s 大头是%s %.2fs（解析是 CPU 活、写库是往返次数；SQL_ECHO=True 还会再拖一层）",
+                document_id, slowest[0], slowest[1],
+            )
         return {"ok": True, "status": DocStatus.INDEXED, "chunks": chunk_count, "tokens": token_count,
                 "reason": None}
 

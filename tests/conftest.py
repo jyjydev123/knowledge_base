@@ -24,6 +24,14 @@ os.environ.setdefault("MEMORY_BACKEND", "local")
 # 而 /health 之类的用例必须保持确定性 —— 一个靠外部服务状态的测试比没写更糟。
 os.environ.setdefault("REDIS_ENABLED", "False")
 
+# 两个 key 必须**硬置空**，不能用 setdefault：Settings 读的是 `.env` 文件，
+# 本机一旦填了真 key，"没配 key 就该明确报错"的用例就不再报错（DID NOT RAISE），
+# 而短期记忆折叠那条会**真的联网调 DeepSeek**，摘要内容变成模型自由发挥 → 断言随机失败，
+# 顺带烧配额。环境变量优先级高于 .env 文件，所以空串能把配置里的值压住。
+# （需要"有 key"场景的用例自己在 monkeypatch 里造，不靠本机环境。）
+os.environ["LLM_API_KEY"] = ""
+os.environ["EMBEDDING_API_KEY"] = ""
+
 import pytest  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 from sqlalchemy import event  # noqa: E402

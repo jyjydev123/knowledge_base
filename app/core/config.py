@@ -106,6 +106,40 @@ class Settings(BaseSettings):
     # 这里必须 <= 上限；VECTOR_INDEX_BATCH_SIZE 是"一批多少条切块"，两者是不同的层。
     EMBEDDING_BATCH_SIZE: int = DASHSCOPE_EMBEDDING_BATCH_LIMIT
 
+    # ---------------- 视觉描述（A 路线：图片 → 文字 → 现有切块/向量链路）----------------
+    # 只做一件事：把一张图变成一段**可检索的文字**。产出直接交给 chunker，
+    # 所以图片描述和 md/pdf 走同一套切块、同一张 chunks 表、同一个 pgvector ——
+    # 刻意不新开"多模态检索"这条链路（检索层不用动，才有办法用 --kb 做权限范围）。
+    # key 默认复用百炼那把：text-embedding-v3 和 qwen-vl-max 在同一个兼容模式网关下，
+    # 已经配过 EMBEDDING_API_KEY 的项目不必再配第三把凭证。
+    VISION_MODEL: str = "qwen-vl-max"
+    VISION_API_KEY: str = Field(default="", validation_alias=AliasChoices("VISION_API_KEY", "DASHSCOPE_API_KEY"))
+    VISION_BASE_URL: str = Field(
+        default=DEFAULT_EMBEDDING_BASE_URL,
+        validation_alias=AliasChoices("VISION_BASE_URL", "DASHSCOPE_BASE_URL"),
+    )
+    VISION_TIMEOUT_SECONDS: int = 60
+    VISION_MAX_TOKENS: int = 700          # 描述不是写论文，超了就截
+    VISION_PROMPT: str = ""               # 空 = 用 app/services/vision.py 里的默认提示词（想改措辞不必改代码）
+    # 送模型前的两道闸：先等比缩到 VISION_MAX_PIXELS，再卡字节数。
+    # 手机相册原图动辄 8MB+，直接 base64 上去就是 11MB 请求体，慢、贵、还容易 413。
+    VISION_MAX_PIXELS: int = 1568         # qwen-vl 内部也是按 tile 切的，缩到这一档基本不丢信息
+    VISION_MAX_IMAGE_BYTES: int = 4 * 1024 * 1024
+    # 图片车道总开关：True 且视觉可用 → 上传后 status=pending 进解析流；否则维持 stored（只存不解析）
+    IMAGE_PARSE_ENABLED: bool = True
+    # 扫描件 PDF 兜底：整篇提不到字时把页面栅格化后交给视觉模型。
+    # **默认关**：一页一次付费请求，50 页的扫描件就是 50 次，必须让人明确决定；
+    # 另外栅格化要 pymupdf（可选依赖），没装时开了这个开关也只会给一条说清楚原因的 failed。
+    SCANNED_PDF_VISION: bool = False
+    SCANNED_PDF_MAX_PAGES: int = 5
+
+    # ---------------- 磁盘布局（唯一真源，别再在别处写死 "data"）----------------
+    # data/ 只装**用户上传的原件**（外加 data/share/ 里被授权人传的那份）；
+    # 可重建的派生物（local 记忆车道的 jsonl、以后可能有的解析临时文件）一律进 var/。
+    # 为什么可配置：测试要把这两棵树指到临时目录，否则每跑一次 pytest 工作区就多几十个孤儿目录。
+    DATA_DIR: str = "data"
+    VAR_DIR: str = "var"
+
     # ---------------- 长期记忆（跨会话，按 user_id 隔离）----------------
     # 默认 **pgvector**：长期记忆只认 PostgreSQL 一条路（业务要求：不留第二份记忆数据）。
     # pgvector = langchain_postgres.PGVector：真语义向量，需要 PG 库 + pgvector 扩展 + EMBEDDING_API_KEY
@@ -114,7 +148,7 @@ class Settings(BaseSettings):
     #            以前 pgvector 连不上会自动退 local，那等于"生产上悄悄换了套记忆存储"，
     #            两份数据两套行为，是最难发现的一类问题；现在连不上就明确不记（见 memory_lane_block_reason）。
     MEMORY_BACKEND: Literal["local", "pgvector", "off"] = "pgvector"
-    MEMORY_DIR: str = "data/memory"
+    MEMORY_DIR: str = "var/memory"     # 注意在 var/：这是派生物，不是知识库文件
     MEMORY_TOP_K: int = 3
     MEMORY_SCORE_THRESHOLD: float = 0.5    # 低于这个相似度不进 prompt；调高会漏，调低会混噪音
     MEMORY_DEDUP_THRESHOLD: float = 0.95   # 高于这个相似度不再重复写
@@ -160,7 +194,7 @@ class Settings(BaseSettings):
     SHORT_TERM_SUMMARY_MAX_CHARS: int = 400
     SHORT_TERM_TTL_SECONDS: int = 4 * 60 * 60   # 会话闲置多久算过期（过期即丢窗口）
     SHORT_TERM_MAX_SESSIONS: int = 512          # 进程内最多缓存多少个会话，超出按 LRU 淘汰
-    SHORT_TERM_PERSIST: bool = False            # True 时把窗口落 data/memory/sessions/，重启不丢
+    SHORT_TERM_PERSIST: bool = False            # True 时把窗口落 var/memory/sessions/，重启不丢
     SHORT_TERM_USE_TIKTOKEN: bool = False       # 默认用字符启发式：tiktoken 首次要联网下载词表
 
     # ---------------- 对话（M5：/aichat 会话与问答）----------------
@@ -219,7 +253,9 @@ class Settings(BaseSettings):
             ("LLM_MODEL", "deepseek-chat"),
             ("EMBEDDING_MODEL", "text-embedding-v3"),
             ("EMBEDDING_BASE_URL", DEFAULT_EMBEDDING_BASE_URL),
-            ("MEMORY_DIR", "data/memory"),
+            ("VISION_MODEL", "qwen-vl-max"),
+            ("VISION_BASE_URL", DEFAULT_EMBEDDING_BASE_URL),
+            ("MEMORY_DIR", "var/memory"),
             ("MEMORY_PG_COLLECTION", "long_term_memory"),
         ):
             value = getattr(self, name)
@@ -283,6 +319,29 @@ class Settings(BaseSettings):
     @property
     def embedding_ready(self) -> bool:
         return self._usable_key(self.EMBEDDING_API_KEY)
+
+    @property
+    def vision_api_key(self) -> str:
+        """真正拿去调视觉模型的那把 key：VISION_API_KEY 优先，没填就回落到百炼的 embedding key"""
+        return self.VISION_API_KEY or self.EMBEDDING_API_KEY
+
+    @property
+    def vision_ready(self) -> bool:
+        return self.IMAGE_PARSE_ENABLED and self._usable_key(self.vision_api_key)
+
+    @property
+    def vision_lane_block_reason(self) -> str:
+        """视觉车道不能真跑的原因，空串 = 可以跑
+
+        和 vector_lane_block_reason / memory_lane_block_reason 同一口径：
+        降级必须**看得见**。图片没描述出来会变成"库里有一张搜不到的图"，
+        用户只会以为检索坏了，所以这里必须能被 /health 和 ./start.sh check 读到。
+        """
+        if not self.IMAGE_PARSE_ENABLED:
+            return "IMAGE_PARSE_ENABLED=False，图片只落盘不解析（status=stored）"
+        if not self._usable_key(self.vision_api_key):
+            return "未配置 VISION_API_KEY（留空则复用 EMBEDDING_API_KEY，百炼两处同一把）"
+        return ""
 
     @property
     def embedding_is_dashscope(self) -> bool:

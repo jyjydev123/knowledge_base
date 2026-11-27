@@ -30,6 +30,11 @@ python-pptx==1.0.2                                   # .pptx（同样不支持�
 langchain==1.4.9
 langchain-openai==1.7.4
 
+# 缓存（app/core/cache.py 的 Redis 旁路）
+# 代码里是延迟 import + fail-open：没装也能跑，但缓存车道就等于没有，
+# 所以它列在 pyproject 的正式依赖里，这里必须同步，否则照本文件装环境的人少一个包
+redis==8.1.0
+
 # 记忆层（app/rag/memory/）
 # pgvector 车道：langchain-postgres 是同步实现，驱动必须 psycopg v3 + 显式连接池
 langchain-postgres==0.0.19
@@ -41,3 +46,9 @@ langgraph==1.2.20
 langgraph-checkpoint==4.3.1
 # 注：langgraph.store.postgres 不在 langgraph 里，在 langgraph-checkpoint-postgres；
 #     没装就没有 PostgresStore（长期记忆走的是 PGVector 这条路，不依赖它）。
+
+# ---------- 视觉车道（图片→描述）的可选依赖 ----------
+# Pillow：送模型前等比缩放 + EXIF 转正。没装也能跑，但超限的大图会明确报错而不是自动压缩
+Pillow>=10.0.0
+# PyMuPDF：只有打开 SCANNED_PDF_VISION=True（扫描件 PDF 逐页兜底）才需要，所以默认注释
+# PyMuPDF>=1.24.0

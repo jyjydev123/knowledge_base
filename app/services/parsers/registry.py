@@ -8,7 +8,7 @@
 from pathlib import Path
 from typing import Callable
 
-from app.services.parsers import docx, markdown, pdf, pptx
+from app.services.parsers import docx, image, markdown, pdf, pptx
 from app.services.parsers.base import (
     DocumentParseError,
     ParsedDocument,
@@ -24,6 +24,20 @@ MIME_BY_EXT: dict[str, str] = {
     "txt": "text/plain",
 }
 
+# 图片车道单独一张表，**不并进 PARSERS**：
+# supported_extensions() 是文档上传的白名单唯一来源，png 混进去就等于让
+# POST /documents/upload 也能收图片，两条车道（stored / pending）的区别立刻被抹平。
+IMAGE_MIME_BY_EXT: dict[str, str] = {
+    # 不含 tiff/heic：前者浏览器基本不显示，后者要 libheif 才能解码，
+    # 手机相册能直接导出的格式已经够用（口径与 file_types 的嗅探表一致）
+    "jpg": "image/jpeg",
+    "jpeg": "image/jpeg",
+    "png": "image/png",
+    "gif": "image/gif",
+    "webp": "image/webp",
+    "bmp": "image/bmp",
+}
+
 PARSERS: dict[str, Parser] = {
     "pdf": pdf.parse,
     "docx": docx.parse,
@@ -33,17 +47,31 @@ PARSERS: dict[str, Parser] = {
 }
 
 
+IMAGE_PARSERS: dict[str, Parser] = {ext: image.parse for ext in IMAGE_MIME_BY_EXT}
+
+
 def supported_extensions() -> list[str]:
+    """文档车道支持的扩展名（上传白名单从这里取，图片不在里面）"""
     return sorted(PARSERS)
+
+
+def image_extensions() -> list[str]:
+    """图片车道支持的扩展名（file_types 的白名单从这里取，别再抄一份）"""
+    return sorted(IMAGE_MIME_BY_EXT)
+
+
+def is_image_extension(ext: str) -> bool:
+    return (ext or "").lstrip(".").lower() in IMAGE_MIME_BY_EXT
 
 
 def get_parser(ext: str) -> Parser:
     """按扩展名取解析函数；不支持就 UnsupportedFormatError（调用方转 400）"""
     normalized = (ext or "").lstrip(".").lower()
-    parser = PARSERS.get(normalized)
+    parser = PARSERS.get(normalized) or IMAGE_PARSERS.get(normalized)
     if parser is None:
         raise UnsupportedFormatError(
-            f"不支持的文件类型 .{normalized or '?'}，目前只支持 {'/'.join(supported_extensions())}"
+            f"不支持的文件类型 .{normalized or '?'}，目前只支持 "
+            f"{'/'.join(supported_extensions())}（图片：{'/'.join(image_extensions())}）"
         )
     return parser
 

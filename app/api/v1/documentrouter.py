@@ -29,10 +29,11 @@ from app.db.crud import document_crud
 from app.db.models import DocStatus
 from app.schemas.common import ApiResponse, PageData, PageParams
 from app.schemas.document_schemas import DocumentDetail, DocumentResponse, DocumentStatusOut
-from app.services import file_types, kb_access
+from app.services import file_types, kb_access, vision
 from app.services.parsers.base import UnsupportedFormatError
 from app.services.process_document import (
     SAFE_EXT,
+    data_root,
     delete_document_file,
     document_storage_path,
     kb_storage_dirs,
@@ -46,7 +47,6 @@ from app.services.process_document import (
 router = APIRouter(prefix="/documents", tags=["Documents"])  # 版本前缀统一在 main.py 加，别在这里再写一遍
 
 # 上传/删除/下载共用的边界常量（扩展名与 uuid 段的字符白名单在 process_document 里定义，只此一份）
-USER_DATA_ROOT = FsPath("data")  # 相对进程 CWD（start.sh 在项目根启动）
 PREVIEW_MAX_CHARS = 2000  # 详情正文预览的截断长度
 PREVIEW_CHUNKS = 3        # 预览最多取前几块
 
@@ -177,10 +177,11 @@ def _readable_path(document) -> FsPath | None:
     if stored.is_absolute() or ".." in stored.parts:
         return None
 
-    # file_path 本身已经带 data/ 前缀，直接相对 CWD 解析，不能再拼一次 USER_DATA_ROOT
-    data_root = USER_DATA_ROOT.resolve()
+    # file_path 本身已经带 data/ 前缀，直接相对 CWD 解析，不能再拼一次根目录
+    # 根目录每次现取（data_root()）：它是 settings.DATA_DIR，测试会把它指到临时目录
+    root = FsPath(data_root()).resolve()
     resolved = stored.resolve()
-    if data_root not in resolved.parents:
+    if root not in resolved.parents:
         return None
     return resolved
 
@@ -544,6 +545,7 @@ async def upload_image(
     current_user: CurrentUser,
     access: KBWriter,
     db: DB,
+    background_tasks: BackgroundTasks,
     file: Annotated[UploadFile, File(description="图片（" + " / ".join(sorted(IMAGE_EXTENSIONS))
                                      + f"），单张不超过 {settings.IMAGE_MAX_SIZE_MB}MB")],
     kb_id: Annotated[str, Query(description="所属知识库ID")],
@@ -552,11 +554,12 @@ async def upload_image(
     """
     显示需求：后端要保留一个上传图片的接口（手机化之后相册是主要来源之一）。
 
-    **这一条是「存得住、取得回」，不是「看得懂」**：
-        图片不参与文本解析、不进切块、不进向量库 —— 所以 status 直接是 `stored`，
-        不是 pending。为什么不是 pending：pending 会被重索引逻辑捞出来跑解析，图片解析必失败，
-        白白变成一条 failed + 一句误导性的 error_msg（用户以为系统坏了）。
-        OCR / 多模态问答接上之后再把它推进解析流，那是 TODO.md §8 的事。
+    **图片现在能"看得懂了"（A 路线：图片 → 视觉描述 → 现有切块/向量链路）**：
+        视觉车道可用（VISION_API_KEY 或百炼那把 EMBEDDING_API_KEY 已配 + IMAGE_PARSE_ENABLED=True）
+        → status=pending，丢后台任务，描述文字和 pdf/md 一样进 chunks 与向量库，能被 /search 命中；
+        车道不可用 → 维持 status=stored（只存不解析），和以前完全一致。
+        为什么"不可用"时不给 pending：pending 会被重索引/启动捡漏逻辑捞出来跑解析，
+        没车道就必失败，白白留下一条 failed + 误导性 error_msg（用户以为系统坏了）。
 
     和图片车道一起复用的是同一套东西：路径规则（document_storage_path）、权限（KBWriter）、
     体积/嗅探闸门（_guard_upload_body）、下载与删除（/download /delete）。
@@ -574,6 +577,9 @@ async def upload_image(
 
     document_id = uuid.uuid4()
     stored_path = document_storage_path(kb.owner_id, current_user.id, kb.id, document_id, ext)
+    # 车道可用就把图片推进解析流；描述文字走 chunker → chunks → pgvector，和 pdf 同一条路
+    parse_it = vision.vision_available()
+    initial_status = DocStatus.PENDING if parse_it else DocStatus.STORED
     try:
         await run_in_threadpool(
             new_document_file_path,
@@ -602,7 +608,7 @@ async def upload_image(
             file_hash=file_hash,
             db=db,
             document_id=document_id,
-            status=DocStatus.STORED,
+            status=initial_status,
         )
     except Exception as exc:
         await _cleanup_uploaded_file(kb.owner_id, current_user.id, kb.id, document_id, ext)
@@ -612,8 +618,23 @@ async def upload_image(
         await _cleanup_uploaded_file(kb.owner_id, current_user.id, kb.id, document_id, ext)
         raise ConflictError("图片入库失败，请重试")
 
-    # 刻意**不**丢后台任务：图片没有可解析的文字，跑一遍解析只会变 failed
-    return ApiResponse.ok(DocumentResponse.model_validate(document), msg="上传成功")
+    if not parse_it:
+        # 没车道就别丢任务：跑一次解析只会得到一条 failed + 一句"视觉车道未就绪"
+        return ApiResponse.ok(DocumentResponse.model_validate(document), msg="上传成功（未启用视觉解析，仅存档）")
+    background_tasks.add_task(process_document, str(document.id))
+    return ApiResponse.ok(DocumentResponse.model_validate(document), msg="上传成功，正在生成图片描述")
+
+
+def _stored_can_parse(document) -> bool:
+    """stored 资源现在能不能被"重新解析"接管
+
+    场景：图先传上来了（那时还没配 key，status=stored），后来开了视觉车道 ——
+    这种图应该能通过 /documents/reindex 补描述，而不是永远卡在 stored 只能删了重传。
+    """
+    if not vision.vision_available():
+        return False
+    suffix = FsPath(str(document.file_path or "")).suffix.lstrip(".").lower()
+    return file_types.is_image_extension(suffix)
 
 
 # ======================= 失败重跑入口（§3 的尾巴） =======================
@@ -650,8 +671,8 @@ async def reindex_document(
     if not access.can_write:
         raise ForbiddenError("需要知识库的读写（write）权限才能重新解析文档")
 
-    if document.status == DocStatus.STORED:
-        # 图片这类"落盘但不解析"的资源：重跑解析只会得到 failed，明确拒绝比默默失败好
+    if document.status == DocStatus.STORED and not _stored_can_parse(document):
+        # 图片这类"落盘但不解析"的资源：没车道时重跑解析只会得到 failed，明确拒绝比默默失败好
         counts = await document_crud.count_by_status(document.kb_id, db)
         return ApiResponse.ok(
             DocumentStatusOut(
@@ -663,7 +684,7 @@ async def reindex_document(
                 orphan_files=[],
                 healthy=True,
             ),
-            msg="该资源不参与文本解析（图片/多媒体），无需重跑",
+            msg="该资源不参与文本解析（没配视觉车道，或不是可描述的图片），无需重跑",
         )
 
     # 先把状态拨回 pending：前端立刻能看到"已经在重跑了"，而不是等后台任务改状态

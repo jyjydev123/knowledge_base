@@ -21,22 +21,21 @@ from __future__ import annotations
 import re
 
 from app.services.parsers.base import UnsupportedFormatError
+from app.services.parsers.registry import IMAGE_MIME_BY_EXT as MIME_BY_EXT_IMAGES
 from app.services.parsers.registry import MIME_BY_EXT
 
 # 文档车道：直接引用解析器注册表，**不在这里抄一份清单**
 DOCUMENT_MIME_BY_EXT: dict[str, str] = dict(MIME_BY_EXT)
 
-# 图片车道：只做「能安全落盘 + 将来能被多模态模型吃进去」的子集。
-# 不含 tiff/heic：前者浏览器基本不显示，后者要装 libheif 才能解码，
-# 手机相册里能直接导出的格式已经够用了，多一个格式就多一条要实测的链路。
-IMAGE_MIME_BY_EXT: dict[str, str] = {
-    "jpg": "image/jpeg",
-    "jpeg": "image/jpeg",
-    "png": "image/png",
-    "gif": "image/gif",
-    "webp": "image/webp",
-    "bmp": "image/bmp",
-}
+# 图片车道：清单的唯一来源是 parsers.registry.IMAGE_MIME_BY_EXT（那里同时登记了图片解析器）。
+# 上一轮的教训就是这里抄了一份：上传收下了却没人能解析，或者解析器支持但上传拒收。
+# 现在加一种图片格式只需要改 registry 那一处，白名单、嗅探、解析器自然对齐。
+IMAGE_MIME_BY_EXT: dict[str, str] = dict(MIME_BY_EXT_IMAGES)
+
+def is_image_extension(ext: str) -> bool:
+    """这个扩展名属于图片车道吗（路径复算/重索引判断都用它，别在调用方抄一份清单）"""
+    return (ext or "").lstrip(".").lower() in IMAGE_MIME_BY_EXT
+
 
 # 扩展名字符白名单（和 process_document.SAFE_EXT 同口径，别在这里放宽）
 _EXT_PATTERN = re.compile(r"^[A-Za-z0-9]{1,10}$")

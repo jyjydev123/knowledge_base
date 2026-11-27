@@ -168,6 +168,20 @@ def _memory_section() -> dict:
     }
 
 
+def _vision_section() -> dict:
+    """视觉车道（图片 → 描述）的配置层面体检：配了哪个模型、能不能真跑、不能跑的原因
+
+    和 memory/cache 一样**不影响 HTTP 状态码**：视觉车道没配只是"图片不能被搜到"，
+    文本知识库照样能用，把它打成 503 会让编排系统摘掉一台正常的实例。
+    """
+    return {
+        "configured": settings.VISION_MODEL if settings.IMAGE_PARSE_ENABLED else "off",
+        "ok": settings.vision_ready,
+        "reason": settings.vision_lane_block_reason,
+        "scanned_pdf": settings.SCANNED_PDF_VISION,
+    }
+
+
 async def cache_section() -> dict:
     """`/health` 里的缓存一节：Redis 这条车道到底有没有在干活
 
@@ -212,6 +226,7 @@ async def health_payload(engine: AsyncEngine | None = None, timeout_seconds: flo
                 "checked_tables": len(expected_tables()),
             },
             "memory_backend": _memory_section(),
+            "vision": _vision_section(),
             "cache": await cache_section(),
         }
 
@@ -236,5 +251,6 @@ async def health_payload(engine: AsyncEngine | None = None, timeout_seconds: flo
             "checked_tables": info["checked_tables"],
         },
         "memory_backend": _memory_section(),
+        "vision": _vision_section(),
         "cache": await cache_section(),
     }
