@@ -10,7 +10,7 @@
 -- 注意 1：本脚本只 CREATE ... IF NOT EXISTS，不会给已存在的表加列/改类型。
 --         改过 models.py 后，开发库请 --drop 重建，正式环境等接 alembic（TODO.md P1）。
 -- 注意 2：向量部分还没启用（pgvector 暂不处理）：chunks 表没有 embedding 列；
---         等向量方案定了再补 CREATE EXTENSION vector / vector(N) 列 / HNSW 索引（TODO.md P0-M3）。
+--         等向量方案定了再补 CREATE EXTENSION vector / vector(N) 列 / HNSW 索引（TODO.md §1）。
 --         本机 PG 17 目前没装 pgvector 扩展，直接跑 CREATE EXTENSION 会报错，所以先注释掉。
 -- ============================================================
 
@@ -60,6 +60,24 @@ CREATE TABLE IF NOT EXISTS knowledge_bases (
 );
 
 CREATE INDEX IF NOT EXISTS ix_kb_owner_updated ON knowledge_bases (owner_id, updated_at);
+
+CREATE TABLE IF NOT EXISTS password_reset_codes (
+	id UUID NOT NULL, 
+	code_hash VARCHAR(72) NOT NULL, 
+	user_id UUID NOT NULL, 
+	expires_at TIMESTAMP WITH TIME ZONE NOT NULL, 
+	used_at TIMESTAMP WITH TIME ZONE, 
+	attempts INTEGER DEFAULT 0 NOT NULL, 
+	channel VARCHAR(16), 
+	client_ip VARCHAR(45), 
+	created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP NOT NULL, 
+	PRIMARY KEY (id), 
+	FOREIGN KEY(user_id) REFERENCES users (id) ON DELETE CASCADE
+);
+
+CREATE INDEX IF NOT EXISTS ix_pwd_code_user_created ON password_reset_codes (user_id, created_at);
+
+CREATE INDEX IF NOT EXISTS ix_pwd_code_expires ON password_reset_codes (expires_at);
 
 CREATE TABLE IF NOT EXISTS tokens (
 	id UUID NOT NULL, 
@@ -178,8 +196,8 @@ CREATE TABLE IF NOT EXISTS chunks (
 	FOREIGN KEY(owner_id) REFERENCES users (id) ON DELETE CASCADE
 );
 
-CREATE INDEX IF NOT EXISTS ix_chunk_owner_kb ON chunks (owner_id, kb_id);
-
 CREATE INDEX IF NOT EXISTS ix_chunk_kb ON chunks (kb_id);
+
+CREATE INDEX IF NOT EXISTS ix_chunk_owner_kb ON chunks (owner_id, kb_id);
 
 COMMIT;

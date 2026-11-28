@@ -191,6 +191,33 @@ async def set_json(key: str, value: dict, ttl_seconds: int | None = None) -> boo
     return True
 
 
+async def incr(key: str, ttl_seconds: int) -> int | None:
+    """计数器 +1 并保证有 TTL，返回**当前计数**；拿不到结果返回 None（调用方必须当"没限到"）
+
+    给限流用（忘记密码的申请频率、以后可能的登录失败锁定）。两个坑都在这几行里：
+
+    * INCR 不会带过期时间。第一次 +1 之后必须补 EXPIRE，否则这个键永久留在 Redis 里，
+      限流窗口变成"这辈子只能申请一次"。
+    * 反过来，如果每次 +1 都重设 TTL，只要有人持续触发，窗口就永远滑动不过期，
+      等于永远解不了封 —— 所以只在"这一轮的第一个请求"（返回值==1）时设 TTL。
+
+    失败一律 fail-open（返回 None）：限流是止损手段，不是安全边界，
+    Redis 挂了不能把正常用户挡在门外。
+    """
+    client = await get_client()
+    if client is None:
+        return None
+    try:
+        count = int(await client.incr(key))
+        if count == 1:
+            await client.expire(key, max(int(ttl_seconds), 1))
+    except Exception as exc:  # noqa: BLE001
+        _mark_disabled(f"计数失败（{type(exc).__name__}: {exc}）", error=True)
+        return None
+    _mark_ok()
+    return count
+
+
 async def delete(*keys: str) -> int:
     """删键（铁律 2 的落点：业务写库成功之后调用它）。返回真正删掉的个数"""
     targets = [key for key in keys if key]
@@ -289,6 +316,7 @@ __all__ = [
     "delete",
     "get_client",
     "get_json",
+    "incr",
     "ping",
     "reset_state",
     "set_json",

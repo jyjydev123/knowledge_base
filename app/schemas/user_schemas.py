@@ -120,3 +120,58 @@ class TokenResponse(BaseModel):
     token_type: str = Field(default="bearer", description="token 类型")
     expires_in: int = Field(description="有效期，单位秒")
     user: UserResponse | None = Field(default=None, description="登录用户信息")
+
+
+class ForgotPasswordRequest(BaseModel):
+    """「忘记密码」申请验证码（匿名接口，只需要账号）
+
+    账号不存在时接口**照样返回 200 + 同一句话**：这是防枚举，不是偷懒。
+    所以这里不能加"必须存在"之类的校验，校验只做形状（非空、长度）。
+    """
+
+    account: str = Field(min_length=1, max_length=255, description="用户名或邮箱，两者都可以")
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    @field_validator("account")
+    @classmethod
+    def _account_not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("账号不能为空")
+        return value
+
+
+class PasswordResetConfirm(BaseModel):
+    """「忘记密码」用验证码设新密码（匿名接口）
+
+    为什么要带 account：6 位数字码不自带身份（长令牌是"知道串=知道是谁"，短码不是），
+    服务端要靠 account 找到那个人那条**待用的码**再去 verify。
+    这里只校验形状（纯数字、长度 4-8）—— 真伪、过期、尝试次数全在服务层，
+    因为"码错了"和"没这个账号"必须是同一句话，schema 不能替它们做区分。
+    """
+
+    account: str = Field(min_length=1, max_length=255, description="用户名或邮箱（申请时用的那个）")
+    code: str = Field(min_length=4, max_length=8, description="收到的数字验证码")
+    new_password: str = Field(
+        min_length=PASSWORD_MIN_LENGTH,
+        max_length=PASSWORD_MAX_LENGTH,
+        description="新密码，6-72位（bcrypt 只用前 72 字节）",
+    )
+
+    model_config = ConfigDict(str_strip_whitespace=True)
+
+    @field_validator("account", "new_password")
+    @classmethod
+    def _not_blank(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("不能传空字符串")
+        return value
+
+    @field_validator("code")
+    @classmethod
+    def _code_is_digits(cls, value: str) -> str:
+        text = value.strip()
+        if not text.isdigit():
+            # 只说"格式"，不碰"存不存在/对不对"，防枚举的口径保持干净
+            raise ValueError("验证码只能是数字")
+        return text

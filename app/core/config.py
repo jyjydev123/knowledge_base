@@ -229,6 +229,48 @@ class Settings(BaseSettings):
     # 探库超时：远端不可达时 TCP 连接会挂在内核重试里，没超时 /health 自己就成故障源
     HEALTH_CHECK_TIMEOUT_SECONDS: float = 2.0
 
+    # ---------------- 日志（app/core/logging_conf.py，TODO.md §6.3）----------------
+    # 为什么这些值必须存在：项目里十几处 `logging.getLogger("app.*")` 长期**没有任何 handler**
+    # —— uvicorn 的 LOGGING_CONFIG 只配 uvicorn/uvicorn.error/uvicorn.access，不碰 root，
+    # 而 logging.lastResort 只放行 WARNING 以上。结果是 logger.info 全部静默丢弃，
+    # 排错时"后端什么都没打"其实是被丢了，不是没执行。setup_logging() 就是补这一层。
+    LOG_LEVEL: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+    LOG_TO_CONSOLE: bool = True          # 容器里靠 stdout 就够了（docker logs / journald）
+    LOG_TO_FILE: bool = True             # 本机跑 ./start.sh all 时，后端那个窗口的滚走历史全靠它
+    LOG_DIR: str = "logs"
+    LOG_FILE_NAME: str = "app.log"
+    LOG_MAX_BYTES: int = 10 * 1024 * 1024    # 单文件 10MB 滚动
+    LOG_BACKUP_COUNT: int = 5                # 留 5 份 = 最多 60MB，不会哪天把磁盘吃掉
+    # True = 由中间件打一条带耗时的访问日志（`POST /api/v1/... → 200 1834.2ms`），
+    # 同时把 uvicorn.access 压掉，避免同一个请求打两遍。False = 交回 uvicorn 自己打。
+    LOG_ACCESS_LINES: bool = True
+
+    # ---------------- 忘记密码 / 密码重置（TODO.md §6.1）----------------
+    # 6 位数字验证码：库里存的是 **bcrypt**（不是 sha256 —— 10^6 种可能的东西用快哈希
+    # 等于明文，见 app/db/crud/reset_crud.py 顶部）。丢了只能重新申请，没有"再发同一个码"。
+    RESET_CODE_LENGTH: int = 6
+    RESET_CODE_TTL_MINUTES: int = 10
+    # 同一条码最多试错几次就到顶作废。**这是短码的命根子**：没有它，匿名接口可以无限试 10^6
+    RESET_CODE_MAX_ATTEMPTS: int = 5
+    # 同一账号两次申请的最小间隔（**查数据库**判定，Redis 关掉时限流依然生效）
+    RESET_REQUEST_COOLDOWN_SECONDS: int = 60
+    # 同一 IP 在窗口内最多申请多少次（走 Redis 计数器；Redis 不在就只靠上面那条兜底）
+    RESET_REQUEST_IP_LIMIT: int = 10
+    RESET_REQUEST_IP_WINDOW_SECONDS: int = 3600
+    # 送达通道：console=把验证码打进服务端日志（=本机自测用的"模拟发送"，只适合单人本地部署）
+    #           file   =写进 var/reset/（磁盘上是等于一次改密码机会的明文，用完整即删）
+    #           smtp   =真的发邮件，需要下面 SMTP_* 五项
+    RESET_DELIVERY: Literal["console", "file", "smtp"] = "console"
+    RESET_FILE_DIR: str = "var/reset"     # 在 var/ 下：这是可丢弃的派生物，不是知识库文件
+    RESET_FILE_RETENTION_HOURS: int = 24
+    # 只有 RESET_DELIVERY=smtp 才用到。密码走环境变量，绝不写进代码或提交进 git
+    SMTP_HOST: str = ""
+    SMTP_PORT: int = 465
+    SMTP_USER: str = ""
+    SMTP_PASSWORD: str = ""
+    SMTP_FROM: str = ""
+    SMTP_SSL: bool = True                 # True=隐式 TLS(465)；False=STARTTLS(587)
+
     # ---------------- 跨域 ----------------
     # 逗号分隔，例如 http://localhost:5173,http://127.0.0.1:5173
     CORS_ORIGINS: str = "*"
@@ -369,6 +411,41 @@ class Settings(BaseSettings):
     def vector_lane_ready(self) -> bool:
         """向量检索/向量入库这条路现在能不能真跑（缺 key 或连的是 SQLite 就不行）"""
         return self.embedding_ready and not self.DATABASE_URL.startswith("sqlite")
+
+    @property
+    def smtp_ready(self) -> bool:
+        """SMTP 通道配齐了吗（缺一项就当没配，别等第一次发邮件才炸）"""
+        return bool((self.SMTP_HOST or "").strip()) and bool((self.SMTP_FROM or self.SMTP_USER).strip())
+
+    @property
+    def reset_lane_block_reason(self) -> str:
+        """「忘记密码」这条车道现在送不出去的原因；空串 = 可以送
+
+        口径和 vision/memory/vector 三条车道一致：**降级必须看得见**。
+        这里最关键的一条是 console 车道 —— 它把带令牌的链接打进服务端日志，
+        等于"谁能看日志谁就能改密码"，单人本地部署可以接受，多用户/外网就不行，
+        所以必须让 ./start.sh check 和运维都一眼看到当前用的是哪条通道。
+        """
+        if self.RESET_CODE_TTL_MINUTES <= 0:
+            return "RESET_CODE_TTL_MINUTES<=0，验证码一签发就过期（等于关掉忘记密码）"
+        if int(self.RESET_CODE_LENGTH) < 4:
+            return "RESET_CODE_LENGTH<4，验证码短到可以盲猜（等于把改密码接口开放）"
+        if int(self.RESET_CODE_MAX_ATTEMPTS) <= 0:
+            return "RESET_CODE_MAX_ATTEMPTS<=0 等于不限尝试次数，6 位数字会被在线爆破"
+        if self.RESET_DELIVERY == "smtp" and not self.smtp_ready:
+            return "RESET_DELIVERY=smtp 但 SMTP_HOST/SMTP_FROM 没配齐：验证码发不出去"
+        if self.RESET_DELIVERY == "file" and not (self.RESET_FILE_DIR or "").strip():
+            return "RESET_DELIVERY=file 但 RESET_FILE_DIR 为空：没地方落文件"
+        return ""
+
+    @property
+    def reset_lane_warning(self) -> str:
+        """车道能跑、但有安全代价时给一句话（不改行为，只让 check 能提醒）"""
+        if self.RESET_DELIVERY == "console":
+            return "console 车道=把验证码打进日志（终端/ logs/app.log 抄码），仅适合单人本地部署；多用户请换 smtp"
+        if self.RESET_DELIVERY == "file":
+            return "file 车道=验证码落在 var/reset/ 明文文件（0600），用完即删，多人环境请换 smtp"
+        return ""
 
     @property
     def cors_origin_list(self) -> list[str]:

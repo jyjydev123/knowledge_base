@@ -16,7 +16,7 @@ from app.core.config import settings
 
 TABLES = {
     "chat_messages", "chat_sessions", "chunks", "documents", "kb_shares",
-    "knowledge_bases", "tokens", "users",
+    "knowledge_bases", "password_reset_codes", "tokens", "users",
 }  # 和 app/db/models.py 里的 __tablename__ 保持一致，加表就要同步这里
 
 

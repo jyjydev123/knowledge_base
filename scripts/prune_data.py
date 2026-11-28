@@ -31,6 +31,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sqlalchemy import select  # noqa: E402
 
 from app.core.config import settings  # noqa: E402
+from app.core.logging_conf import setup_logging  # noqa: E402
+
+# 脚本也要配日志：app.services.vector / app.services.document 那几条 INFO
+# （耗时、批量进度、失败原因）在没有 handler 时是被静默丢掉的，见 docs/OPERATIONS.md
+setup_logging()
 from app.db import models  # noqa: F401,E402  确保文档模型注册
 from app.db.models import Document, KnowledgeBase  # noqa: E402
 from app.db.psql_config import AsyncSessionLocal  # noqa: E402

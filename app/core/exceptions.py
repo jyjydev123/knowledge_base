@@ -63,3 +63,14 @@ class NotImplementedFeatureError(BusinessError):
 
     def __init__(self, msg: str = "该接口尚未实现", data=None) -> None:
         super().__init__(msg=msg, status=501, data=data)
+
+
+class RateLimitError(BusinessError):
+    """操作太频繁，返回 429（现在只有「忘记密码」用，以后登录限流也用它）
+
+    和 ConflictError(409) 的区别不是语义洁癖：429 带 `Retry-After` 的约定，
+    客户端/反代看到它就该退避，而 409 是"你这个请求本身跟现状冲突"，重试也没用。
+    """
+
+    def __init__(self, msg: str = "操作太频繁，请稍后再试", data=None) -> None:
+        super().__init__(msg=msg, status=429, data=data)

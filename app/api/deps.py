@@ -10,7 +10,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.exceptions import ForbiddenError, NotFoundError, ParamError, UnauthorizedError
 from app.core.security import decode_access_token
-from app.db.crud import kb_crud, token_crud
+from app.db.crud import kb_crud, token_crud, user_crud
 from app.db.models import User
 from app.db.psql_config import AsyncSessionLocal, get_db
 from app.services import user_cache
@@ -153,8 +153,52 @@ KBReader = Annotated[KbAccess, Depends(require_kb_access("read"))]
 KBWriter = Annotated[KbAccess, Depends(require_kb_access("write"))]
 KBManager = Annotated[KbAccess, Depends(require_kb_access("manage"))]
 
+async def lookup_reset_account(
+    request: Request,
+    db: DB,
+) -> User | None:
+    """「忘记密码」申请车道：按 account（用户名或邮箱）找账号，**找不到就返回 None**
+
+    为什么单独立一个依赖，而不是在路由里现查：
+      1. 这条车道没有登录态可言（用户正因为登不进去才用它），套不了 `get_current_user`；
+      2. "存在与否"和"能不能发链接"是两件事。路由拿到 None 之后**仍然回 200 + 同一句话**，
+         陌生人无法从响应里区分"没这个账号"和"有账号"—— 防枚举是这条车道唯一的安全属性，
+         所以判断结果必须回到路由手里，而不是在依赖里直接 raise NotFoundError；
+      3. is_active / 已注销这类判断**不在这里做**（那是业务规则，归 password_reset 服务层）。
+
+    account 从 body 里读（`request.json()`，Starlette 会缓存，和路由自己的 Pydantic
+    模型不冲突）：不复用 UserLogin —— 那个模型必填 password，语义完全不对。
+    """
+    account = await _read_account_field(request)
+    if not account:
+        return None
+    return await user_crud.get_user_by_account(account, db)
+
+
+async def _read_account_field(request: Request) -> str:
+    payload = await _safe_json(request)
+    value = payload.get("account") or payload.get("username") or payload.get("email")
+    return str(value).strip() if value else ""
+
+
+async def _safe_json(request: Request) -> dict:
+    """请求体不是合法 JSON / 不是对象时返回空字典，而不是抛 400
+
+    为什么不能抛：抛了就是"格式不对"和"账号不存在"两种响应，
+    陌生人可以拿这个差异枚举账号。这条车道宁可后面因为字段缺失回一句统一提示。
+    """
+    try:
+        data = await request.json()
+    except Exception:  # noqa: BLE001 - 非法 JSON 是外部输入，不是故障
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 CurrentUser = Annotated[User, Depends(get_current_user)]
 AdminUser = Annotated[User, Depends(require_admin_dep)]
 CurrentToken = Annotated[str, Depends(get_current_token)]
 SessionFactory = Annotated[Callable[[], AbstractAsyncContextManager[AsyncSession]], Depends(get_session_factory)]
 OptionalUser = Annotated[User | None, Depends(get_optional_user)]
+# 「忘记密码」两条匿名车道（申请 / 验码）都先按 account 找账号。
+# None = 查不到，**由服务层/路由决定回统一文案**（这里绝不能 raise，否则就是账号枚举机）
+ResetAccount = Annotated[User | None, Depends(lookup_reset_account)]

@@ -11,6 +11,9 @@ os.environ.setdefault("DATABASE_URL", "sqlite+aiosqlite:///:memory:")
 os.environ.setdefault("SECRET_KEY", "test-secret-key")
 os.environ.setdefault("ADMIN_USERNAMES", "admin")
 os.environ.setdefault("SQL_ECHO", "False")
+# 测试车道**不往仓库的 logs/ 写文件**：跑一次全量会往里塞几万行噪声（和 data/ 里那些孤儿目录
+# 一样的下场）。日志层的文件行为在 tests/test_logging_conf.py 里用 tmp_path 显式测。
+os.environ.setdefault("LOG_TO_FILE", "False")
 # 上传接口默认会丢一个后台解析任务，而测试里全局引擎是**没建表的内存库**：
 # 任务跑了只会制造 "no such table" 噪声。索引逻辑用 process_document(session=...) 直接测。
 os.environ.setdefault("DOCUMENT_INDEX_ON_UPLOAD", "False")

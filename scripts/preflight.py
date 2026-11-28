@@ -128,6 +128,29 @@ def build_checks() -> list[tuple[str, bool, str]]:
             + ('，空文件拒收' if settings.UPLOAD_REJECT_EMPTY else '，空文件放行'),
         ),
         (
+            '日志',
+            bool(settings.LOG_TO_CONSOLE or settings.LOG_TO_FILE),
+            f'level={settings.LOG_LEVEL} 终端={settings.LOG_TO_CONSOLE} '
+            f'文件={settings.LOG_DIR}/{settings.LOG_FILE_NAME}'
+            f'({max(settings.LOG_MAX_BYTES // (1024 * 1024), 1)}MB×{settings.LOG_BACKUP_COUNT}) '
+            f'访问日志={settings.LOG_ACCESS_LINES}'
+            + ('' if settings.LOG_TO_CONSOLE or settings.LOG_TO_FILE else '  → 两条输出都关了，等于没有日志'),
+        ),
+        (
+            '忘记密码',
+            not settings.reset_lane_block_reason,
+            f'通道={settings.RESET_DELIVERY} 码={settings.RESET_CODE_LENGTH}位 '
+            f'有效={settings.RESET_CODE_TTL_MINUTES}分钟 最多试={settings.RESET_CODE_MAX_ATTEMPTS}次 '
+            f'冷却={settings.RESET_REQUEST_COOLDOWN_SECONDS}s IP限={settings.RESET_REQUEST_IP_LIMIT}次/'
+            f'{settings.RESET_REQUEST_IP_WINDOW_SECONDS}s'
+            + (f'  → {settings.reset_lane_block_reason}' if settings.reset_lane_block_reason else '')
+            + (
+                ''
+                if settings.reset_lane_block_reason or not settings.reset_lane_warning
+                else f'  ⚠ {settings.reset_lane_warning}'
+            ),
+        ),
+        (
             '启动策略',
             True,
             f'DEBUG={settings.DEBUG}（环境变量名是 APP_DEBUG）'

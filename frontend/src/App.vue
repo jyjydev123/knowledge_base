@@ -39,7 +39,8 @@ const AppInner = defineComponent({
     ]
 
     const pageTitle = computed(() => String(route.meta.title ?? 'AI 知识库'))
-    const showChrome = computed(() => route.name !== 'login')
+    // 顶栏/底部 tab 的开关交给路由 meta：以后再加匿名页（重置密码之类）不用回来改这里
+    const showChrome = computed(() => route.name !== 'login' && route.meta.chrome !== false)
 
     const userOptions: DropdownOption[] = [
       { label: '账号设置', key: 'me' },

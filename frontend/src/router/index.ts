@@ -23,6 +23,14 @@ const routes: RouteRecordRaw[] = [
     component: () => import('@/views/LoginView.vue'),
     meta: { public: true, title: '登录' },
   },
+  {
+    path: '/reset-password',
+    name: 'reset-password',
+    component: () => import('@/views/ResetPasswordView.vue'),
+    // public：用户正因为登不进去才打开这条链接；chrome:false 和登录页一样不显示底部 tab。
+    // 已登录也**不**弹回知识库：他可能是从另一台设备的邮件里点的链接，那台确实登录着。
+    meta: { public: true, chrome: false, title: '重置密码' },
+  },
   { path: '/kb', name: 'kb', component: () => import('@/views/KbListView.vue'), meta: { title: '知识库' } },
   {
     path: '/kb/:kbId/documents',

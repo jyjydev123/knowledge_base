@@ -6,6 +6,11 @@
 失败时的处理方式:
     路由里直接 raise NotFoundError / ConflictError / UnauthorizedError ...，
     app/main.py 的异常处理器会把它们转成同样的格式，无需每个接口手写。
+
+例外：`/forgot_password` 与 `/reset_password/verify` 是**匿名**接口（用户正登不进去才用它们），
+不带 Authorization，也**不能**因为"查不到账号"就报 404/401 —— 那会变成账号枚举机。
+两条接口的失败/不存在都收敛成同一句提示，见 app/services/password_reset.py
+（忘记密码走的是 6 位数字验证码，不是长令牌链接：短码必须 bcrypt + 限尝试次数）。
 """
 
 from datetime import timedelta
@@ -13,7 +18,7 @@ from typing import Annotated
 
 from fastapi import APIRouter, Query, Request
 
-from app.api.deps import DB, AdminUser, CurrentToken, CurrentUser
+from app.api.deps import DB, AdminUser, CurrentToken, CurrentUser, ResetAccount
 from app.core.config import settings
 from app.core.exceptions import ConflictError, ParamError, UnauthorizedError
 from app.core.security import (
@@ -27,14 +32,16 @@ from app.db.models import UserRole
 from app.schemas.common import ApiResponse, PageData, PageParams
 from app.schemas.user_schemas import (
     AccountDelete,
+    ForgotPasswordRequest,
     PasswordChange,
+    PasswordResetConfirm,
     TokenResponse,
     UserCreate,
     UserLogin,
     UserResponse,
     UserUpdate,
 )
-from app.services import user_cache
+from app.services import password_reset, user_cache
 
 router = APIRouter(
     prefix="/user",
@@ -167,6 +174,57 @@ async def reset_password(payload: PasswordChange, current_user: CurrentUser, db:
 
     return ApiResponse.ok(msg=f"密码修改成功，请重新登录（已失效 token 数: {revoked}）")
 
+
+@router.post(
+    "/forgot_password",
+    response_model=ApiResponse[None],
+    summary="忘记密码：申请重置链接（匿名）",
+)
+async def forgot_password(
+    payload: ForgotPasswordRequest,
+    request: Request,
+    db: DB,
+    account: ResetAccount,
+):
+    """申请一个一次性密码重置**验证码**（TODO.md §6.1）
+
+    **账号存在与否，响应完全一样**（200 + 同一句话）。这条接口是匿名的，
+    只要它能区分"有/没有这个账号"，就变成了一台账号枚举机 —— 用户名 + 邮箱都是唯一索引，
+    撞库成本几乎为零。所以：查不到 → 不发码但照样回成功；禁用/注销的账号同样回成功。
+
+    验证码送到哪儿由 `RESET_DELIVERY` 决定：console=服务端日志（本机自测就抄日志）/
+    file=var/reset/ 明文文件 / smtp=邮件。码本身**绝不出现在响应里**——否则任何人
+    POST 一个账号就能拿到改密码的凭证，这条车道当场归零。
+    申请太频繁返回 429（同账号冷却查库判定，同 IP 计数走 Redis；没 Redis 时只有前者生效）。
+    """
+    client_ip = request.client.host if request.client else None
+    msg = await password_reset.send_code(payload.account, db, user=account, client_ip=client_ip)
+    return ApiResponse.ok(msg=msg)
+
+
+@router.post(
+    "/reset_password/verify",
+    response_model=ApiResponse[None],
+    summary="忘记密码：用验证码设新密码（匿名）",
+)
+async def verify_password_reset(
+    payload: PasswordResetConfirm,
+    db: DB,
+    account: ResetAccount,
+):
+    """凭 account + 验证码设新密码。没这个账号 / 码错 / 已过期 → 同一句「验证码无效或已过期」
+
+    成功后做四件事（顺序在服务层，见 app/services/password_reset.py:verify_and_reset）：
+    作废本码 → 改哈希 → 作废该账号其余未用的码 → 吊销全部 access token + 删用户缓存。
+    最后那步是现成的：`get_current_user` 每次都在 tokens 表里验凭证且**永不进缓存**，
+    所以删行 = 所有端立刻 401，不需要新机制。
+
+    ⚠️ 响应里不说"还剩几次机会"：那种提示只在账号存在时才会出现，等于给枚举机递把手。
+    """
+    user, revoked = await password_reset.verify_and_reset(
+        payload.account, payload.code, payload.new_password, db, user=account
+    )
+    return ApiResponse.ok(msg=f"密码已重置，请用新密码登录（已下线 {revoked} 个登录端）：{user.username}")
 
 @router.post("/delete", response_model=ApiResponse[None], summary="注销账号")
 async def delete_user(payload: AccountDelete, current_user: CurrentUser, db: DB):

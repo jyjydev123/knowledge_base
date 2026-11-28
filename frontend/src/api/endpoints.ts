@@ -52,6 +52,22 @@ export const authApi = {
   resetPassword: (old_password: string, new_password: string) =>
     http.raw<null>('/user/reset_password', { method: 'POST', body: { old_password, new_password } }),
 
+  /**
+   * 匿名：申请一个一次性**验证码**（6 位数字）。返回后端的 msg，界面原样显示。
+   *
+   * ⚠️ 不要根据返回判断"这个账号存不存在" —— 后端刻意让存在/不存在/已禁用**逐字相同**（防枚举），
+   * 这里要是写成"账号不存在"之类的分支，等于把这个安全属性在前端又拆掉了。
+   * 同理：响应里永远不会有码本身，只有通道文案。
+   */
+  forgotPassword: (account: string) => http.ping('/user/forgot_password', { account }),
+
+  /**
+   * 匿名：验证码 + 新密码。account 必带（短码不自带身份，服务端要靠它找到那条待用的码）。
+   * 成功后的 msg 带着"已下线 N 个登录端"，直接显示给用户。
+   */
+  verifyResetCode: (account: string, code: string, new_password: string) =>
+    http.ping('/user/reset_password/verify', { account, code, new_password }),
+
   remove: (password: string) => http.raw<null>('/user/delete', { method: 'POST', body: { password } }),
 
   list: (page = 1, size = 20) => http.get<PageData<UserResponse>>(`/user/list${toQuery({ page, size })}`),

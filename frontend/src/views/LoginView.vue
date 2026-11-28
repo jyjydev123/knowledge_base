@@ -69,6 +69,11 @@ async function submit(): Promise<void> {
               <NInput v-model:value="password" type="password" show-password-on="click" @keyup.enter="submit" />
             </NFormItem>
             <NButton type="primary" block :loading="busy" @click="submit">登录</NButton>
+            <div class="login__forgot">
+              <NButton text type="primary" size="small" @click="router.push({ name: 'reset-password' })">
+                忘记密码？
+              </NButton>
+            </div>
           </NForm>
         </NTabPane>
         <NTabPane name="register" tab="注册">
@@ -100,6 +105,11 @@ async function submit(): Promise<void> {
 .login__brand {
   text-align: center;
   margin-bottom: 18px;
+}
+
+.login__forgot {
+  margin-top: 10px;
+  text-align: center;
 }
 
 .login__brand h1 {

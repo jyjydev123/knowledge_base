@@ -9,9 +9,9 @@
     4. 建表用 scripts/init_db.py（由本文件生成），init_db.sql 只是它的一份可读快照；
     5. 状态字段用 varchar + 本文件里的 StrEnum 常量，不建数据库枚举类型
        （PG 的 CREATE TYPE 改值很痛，varchar + CHECK/常量更灵活）；
-    6. 会话与消息已落库（chat_sessions / chat_messages）。表结构目前**只欠两列**（TODO.md §7）：
-       - chat_sessions.agent（会话选哪个 agent）→ TODO.md §5，M8 一并加
-       - password_reset_tokens 表 → TODO.md §6，配合"忘记密码"一起做
+    6. 会话与消息已落库（chat_sessions / chat_messages）。「忘记密码」需要的
+       password_reset_codes 表**已经加了**（见本文件 PasswordResetCode）；
+       表结构目前只欠一列（TODO.md §7）：chat_sessions.agent → TODO.md §5，M8 一并加
        chunks.embedding 已经**决定不加**：文档向量存在 PGVector 自己的 langchain_pg_* 两张表里，
        靠 metadata 的 chunk_id 对应回 chunks 行（模型已定：百炼 text-embedding-v3 / 1024 维）。
        好处是换 embedding 只重建 collection、不动表结构；代价是检索必须回表（已实现）。
@@ -165,6 +165,49 @@ class Token(Base):
     )
 
     user: Mapped["User"] = relationship(back_populates="tokens")
+
+
+class PasswordResetCode(Base):
+    """"忘记密码"的一次性**数字验证码**（服务 app/services/password_reset.py）
+
+    和上一版（长令牌 + 邮件链接）的区别不只是格式，而是**存储算法必须换**：
+      * 长令牌（43 字符 urlsafe）熵足够，sha256 直出即可 —— 和 tokens 表同一口径；
+      * 6 位数字只有 10^6 种可能，**sha256 等于没存**（拿库的人几十毫秒就能全枚举回来）。
+        所以这里存的是 bcrypt（自带盐 + 慢哈希），配合 attempts 上限使用。
+        这也是为什么本表用 `get_password_hash`/`verify_password` 而不是 hashlib。
+
+    各列挡的事：
+      * expires_at  → 过期即废（默认 10 分钟，RESET_CODE_TTL_MINUTES，比链接版更短，因为码好猜）
+      * used_at     → 一次性：用过/作废之后即使没过期也不能再用
+      * attempts    → 错误尝试计数，到 RESET_CODE_MAX_ATTEMPTS 直接作废该条（防在线爆破 10^6）
+      * user_id CASCADE → 注销账号时不留孤儿码
+      * channel     → 当时用哪条通道送的（console/file/smtp），排障用："他说没收到" 时能定位
+
+    刻意**不建** user 的 relationship：校验全程按 account 找用户再取码，不需要反向关系，
+    多一个关系就多一处 async 里忘 selectinload 就炸的隐患。
+    """
+
+    __tablename__ = "password_reset_codes"
+    __table_args__ = (
+        # 热路径两条：按用户取"最近一条未用的码"（校验）与按 expires_at 扫（purge）
+        Index("ix_pwd_code_user_created", "user_id", "created_at"),
+        Index("ix_pwd_code_expires", "expires_at"),
+    )
+
+    id: Mapped[uuid.UUID] = mapped_column(UUID_TYPE, primary_key=True, default=uuid.uuid4)
+    code_hash: Mapped[str] = mapped_column(String(72), nullable=False)   # bcrypt 串固定 60 字符，留余量
+    user_id: Mapped[uuid.UUID] = mapped_column(
+        UUID_TYPE, ForeignKey("users.id", ondelete="CASCADE"), nullable=False
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0, server_default=text("0"), nullable=False)
+    channel: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    # 申请来源，排障用（"这个码是谁从哪台设备申请的"）。和 tokens 一样是可空字符串
+    client_ip: Mapped[str | None] = mapped_column(String(45), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=text("CURRENT_TIMESTAMP"), nullable=False
+    )
 
 
 class KnowledgeBase(Base, TimestampMixin, SoftDeleteMixin):
